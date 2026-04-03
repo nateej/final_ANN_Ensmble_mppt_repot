@@ -94,6 +94,10 @@ class Config:
     lr_plateau_patience: int = 5
     smoothl1_beta: float = 0.02
     pct_loss_weight: float = 0.15
+    improvement_margin_vhat: float = 0.002
+    improvement_beat_weight: float = 0.50
+    improvement_loss_enabled: bool = True
+    log_improvement_metrics: bool = True
 
     # weighting
     hard_case_weight_gain: float = 0.75
@@ -102,8 +106,8 @@ class Config:
 
     # residual target scaling
     residual_scale_min: float = 0.10
-    residual_scale_quantile: float = 0.995
-    residual_scale_margin: float = 1.10
+    residual_scale_quantile: float = 0.98   # baseline was 0.995
+    residual_scale_margin: float = 1.00     # baseline was 1.10
 
     # ensemble
     ensemble_size: int = 3
@@ -588,6 +592,34 @@ def hybrid_weighted_loss(pred_vhat, true_vhat, weights, beta=0.02, pct_weight=0.
     loss = smooth + pct_weight * pct
     return (loss * weights).mean()
 
+def improvement_aware_loss(
+    pred_vhat,
+    true_vhat,
+    coarse_vhat,
+    weights,
+    beta=0.02,
+    pct_weight=0.15,
+    margin=0.002,
+    beat_weight=0.5,
+):
+    pred_err = torch.abs(pred_vhat - true_vhat)
+    coarse_err = torch.abs(coarse_vhat - true_vhat)
+
+    smooth = torch.where(
+        pred_err < beta,
+        0.5 * (pred_err ** 2) / beta,
+        pred_err - 0.5 * beta
+    )
+
+    pct = pred_err / torch.clamp(torch.abs(true_vhat), min=1e-6)
+
+    # ANN should beat coarse by at least a small margin when possible.
+    # If pred_err is not lower than coarse_err - margin, penalize it.
+    beat_penalty = torch.relu(pred_err - (coarse_err - margin))
+
+    loss = smooth + pct_weight * pct + beat_weight * beat_penalty
+    return (loss * weights).mean()
+
 def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
                     X_va, true_vhat_va, coarse_vhat_va, weight_va,
                     residual_scale, cfg: Config, seed_offset: int = 0):
@@ -628,9 +660,21 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
             optimizer.zero_grad()
             delta_scaled = model(xb)
             pred_vhat = torch.clamp(cb + residual_scale * delta_scaled, 0.0, 1.0)
-            loss = hybrid_weighted_loss(
-                pred_vhat, yb, wb, beta=cfg.smoothl1_beta, pct_weight=cfg.pct_loss_weight
-            )
+            if cfg.improvement_loss_enabled:
+                loss = improvement_aware_loss(
+                    pred_vhat,
+                    yb,
+                    cb,
+                    wb,
+                    beta=cfg.smoothl1_beta,
+                    pct_weight=cfg.pct_loss_weight,
+                    margin=cfg.improvement_margin_vhat,
+                    beat_weight=cfg.improvement_beat_weight,
+                )
+            else:
+                loss = hybrid_weighted_loss(
+                    pred_vhat, yb, wb, beta=cfg.smoothl1_beta, pct_weight=cfg.pct_loss_weight
+                )
             loss.backward()
             optimizer.step()
 
@@ -643,14 +687,39 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
         with torch.no_grad():
             delta_va = model(X_va_t)
             pred_va = torch.clamp(coarse_va_t + residual_scale * delta_va, 0.0, 1.0)
-            val_loss = float(
-                hybrid_weighted_loss(
-                    pred_va, y_va_t, w_va_t, beta=cfg.smoothl1_beta, pct_weight=cfg.pct_loss_weight
-                ).detach().cpu()
-            )
+            if cfg.improvement_loss_enabled:
+                val_loss = float(
+                    improvement_aware_loss(
+                        pred_va,
+                        y_va_t,
+                        coarse_va_t,
+                        w_va_t,
+                        beta=cfg.smoothl1_beta,
+                        pct_weight=cfg.pct_loss_weight,
+                        margin=cfg.improvement_margin_vhat,
+                        beat_weight=cfg.improvement_beat_weight,
+                    ).detach().cpu()
+                )
+            else:
+                val_loss = float(
+                    hybrid_weighted_loss(
+                        pred_va, y_va_t, w_va_t, beta=cfg.smoothl1_beta, pct_weight=cfg.pct_loss_weight
+                    ).detach().cpu()
+                )
             val_pct = float(
                 (torch.abs(pred_va - y_va_t) / torch.clamp(torch.abs(y_va_t), min=1e-6)).mean().cpu() * 100.0
             )
+            pred_err_abs = torch.abs(pred_va - y_va_t)
+            coarse_err_abs = torch.abs(coarse_va_t - y_va_t)
+            ann_better_rate = float((pred_err_abs < coarse_err_abs).float().mean().cpu() * 100.0)
+            ann_equal_or_better_rate = float((pred_err_abs <= coarse_err_abs).float().mean().cpu() * 100.0)
+            mean_coarse_err_pct = float(
+                (coarse_err_abs / torch.clamp(torch.abs(y_va_t), min=1e-6)).mean().cpu() * 100.0
+            )
+            mean_ann_err_pct = float(
+                (pred_err_abs / torch.clamp(torch.abs(y_va_t), min=1e-6)).mean().cpu() * 100.0
+            )
+            ann_minus_coarse_pct_points = mean_coarse_err_pct - mean_ann_err_pct
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -659,13 +728,20 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
             "train_loss": avg_train_loss,
             "val_loss": val_loss,
             "val_mean_pct_err": val_pct,
+            "val_ann_better_rate": ann_better_rate,
+            "val_ann_equal_or_better_rate": ann_equal_or_better_rate,
+            "val_mean_coarse_err_pct": mean_coarse_err_pct,
+            "val_mean_ann_err_pct": mean_ann_err_pct,
+            "val_ann_minus_coarse_pct_points": ann_minus_coarse_pct_points,
             "lr": current_lr,
         })
 
         print(
             f"[model {seed_offset+1}/{cfg.ensemble_size}] "
             f"Epoch {ep:03d} | LR={current_lr:.6f} | train={avg_train_loss:.6f} | "
-            f"val={val_loss:.6f} | val_pct={val_pct:.3f}%"
+            f"val={val_loss:.6f} | val_pct={val_pct:.3f}% | "
+            f"better={ann_better_rate:.2f}% | "
+            f"coarse-ann={ann_minus_coarse_pct_points:.3f} pct-pts"
         )
 
         if val_loss < best_loss - 1e-6:
@@ -1335,6 +1411,10 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
 
         ann_diff_pct = 100.0 * abs(V_ann - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         coarse_diff_pct = 100.0 * abs(V_coarse_best - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        ann_err_abs = abs(V_ann - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        coarse_err_abs = abs(V_coarse_best - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        ann_beats_coarse = int(ann_err_abs < coarse_err_abs)
+        ann_equals_or_beats_coarse = int(ann_err_abs <= coarse_err_abs)
         ann_power_regret_pct = 100.0 * max(oracle.pmpp_true - P_ann, 0.0) / (abs(oracle.pmpp_true) + 1e-9)
 
         hybrid_res, hybrid_log = controller_fn(oracle, models, mu, sd, residual_scale, cfg)
@@ -1356,6 +1436,8 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
             "coarse_diff_pct": coarse_diff_pct,
             "V_ann": V_ann,
             "ann_diff_pct": ann_diff_pct,
+            "ann_beats_coarse": ann_beats_coarse,
+            "ann_equals_or_beats_coarse": ann_equals_or_beats_coarse,
             "ann_power_regret_pct": ann_power_regret_pct,
             "ann_std_vhat": float(ens["std_vhat"]),
             "V_final_hybrid": float(hybrid_log["V_best"]),
@@ -1406,6 +1488,8 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
         "ann_pass_avg_diff_le_5pct": bool(df["ann_diff_pct"].mean() <= 5.0),
         "mean_coarse_diff_pct": float(df["coarse_diff_pct"].mean()),
         "ann_improvement_vs_coarse_pct_points": float(df["coarse_diff_pct"].mean() - df["ann_diff_pct"].mean()),
+        "ann_beats_coarse_rate_pct": float(100.0 * df["ann_beats_coarse"].mean()),
+        "ann_equals_or_beats_coarse_rate_pct": float(100.0 * df["ann_equals_or_beats_coarse"].mean()),
         "mean_final_hybrid_vdiff_pct": float(df["final_hybrid_vdiff_pct"].mean()),
         "max_final_hybrid_vdiff_pct": float(df["final_hybrid_vdiff_pct"].max()),
         "mean_final_ratio_pct": float(df["final_ratio_pct"].mean()),
@@ -1441,6 +1525,43 @@ def evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg: Config):
         {"controller": "optimized", **opt_summary},
     ])
     return comp, baseline_df, opt_df
+
+def evaluate_loss_ablation(exp_curves, dataset, cfg):
+    baseline_cfg = Config(**cfg.__dict__)
+    baseline_cfg.improvement_loss_enabled = False
+    baseline_cfg.residual_scale_quantile = 0.995
+    baseline_cfg.residual_scale_margin = 1.10
+
+    improved_cfg = Config(**cfg.__dict__)
+    improved_cfg.improvement_loss_enabled = True
+    improved_cfg.residual_scale_quantile = 0.98
+    improved_cfg.residual_scale_margin = 1.00
+
+    # Train baseline
+    baseline_models, baseline_mu, baseline_sd, baseline_histories, baseline_best_losses, baseline_residual_scale = train_ensemble(dataset, baseline_cfg)
+    print("\nBaseline loss best validation loss per model:")
+    for i, loss in enumerate(baseline_best_losses, 1):
+        print(f"  model {i}: {loss:.6f}")
+    baseline_summary, baseline_df, _ = evaluate_unseen_300(
+        exp_curves, baseline_models, baseline_mu, baseline_sd, baseline_residual_scale, baseline_cfg,
+        controller_fn=run_global_gmppt_episode_logged
+    )
+
+    # Train improved-loss version
+    improved_models, improved_mu, improved_sd, improved_histories, improved_best_losses, improved_residual_scale = train_ensemble(dataset, improved_cfg)
+    print("\nImprovement-aware loss best validation loss per model:")
+    for i, loss in enumerate(improved_best_losses, 1):
+        print(f"  model {i}: {loss:.6f}")
+    improved_summary, improved_df, _ = evaluate_unseen_300(
+        exp_curves, improved_models, improved_mu, improved_sd, improved_residual_scale, improved_cfg,
+        controller_fn=run_global_gmppt_episode_logged
+    )
+
+    comp = pd.DataFrame([
+        {"experiment": "baseline_loss", **baseline_summary},
+        {"experiment": "improvement_aware_loss", **improved_summary},
+    ])
+    return comp, baseline_df, improved_df, baseline_histories, improved_histories
 
 def evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, cfg):
     state = RuntimeState()
@@ -1574,12 +1695,27 @@ print("Target type: residual refinement around best 12-point coarse voltage")
 print("Input dimension:", X.shape[1])
 print("Average 12-point coarse-only training diff (%):", float(dataset["coarse_diff_pct"].mean()))
 
-print("\nTraining residual-refinement ANN ensemble...")
-models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, cfg)
+RUN_IMPROVEMENT_LOSS_ABLATION = True
 
-print("\nBest validation loss per model:")
-for i, loss in enumerate(best_losses, 1):
-    print(f"  model {i}: {loss:.6f}")
+if RUN_IMPROVEMENT_LOSS_ABLATION:
+    print("\nRunning loss ablation: baseline loss vs improvement-aware loss...")
+    loss_ablation_table, baseline_loss_df, improved_loss_df, baseline_histories, improved_histories = evaluate_loss_ablation(
+        exp_curves, dataset, cfg
+    )
+    print("\n=== LOSS ABLATION SUMMARY (baseline vs improvement-aware loss) ===")
+    display(loss_ablation_table)
+
+    print("\nTraining residual-refinement ANN ensemble for final run with current cfg...")
+    models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, cfg)
+    print("\nBest validation loss per model:")
+    for i, loss in enumerate(best_losses, 1):
+        print(f"  model {i}: {loss:.6f}")
+else:
+    print("\nTraining residual-refinement ANN ensemble...")
+    models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, cfg)
+    print("\nBest validation loss per model:")
+    for i, loss in enumerate(best_losses, 1):
+        print(f"  model {i}: {loss:.6f}")
 
 print("\nEvaluating on unseen test/experimental curves (static single-curve benchmark)...")
 summary, df_results, examples = evaluate_unseen_300(
@@ -1612,6 +1748,13 @@ display(dyn_ab_table)
 
 display(df_results.head(10))
 
+print("\n=== ANN VS COARSE REPORT ===")
+print(f"mean_ann_diff_pct: {summary['mean_ann_diff_pct']:.4f}")
+print(f"mean_coarse_diff_pct: {summary['mean_coarse_diff_pct']:.4f}")
+print(f"ann_improvement_vs_coarse_pct_points: {summary['ann_improvement_vs_coarse_pct_points']:.4f}")
+print(f"ann_beats_coarse_rate_pct: {summary['ann_beats_coarse_rate_pct']:.2f}")
+print(f"ann_equals_or_beats_coarse_rate_pct: {summary['ann_equals_or_beats_coarse_rate_pct']:.2f}")
+
 if MAKE_PLOTS:
     plot_training_histories(histories)
     visualize_examples(examples, n_viz=cfg.n_viz, seed=cfg.seed)
@@ -1620,6 +1763,7 @@ if MAKE_PLOTS:
 if SAVE_MODEL_BUNDLE:
     bundle = {
         "config": cfg.__dict__,
+        "improvement_loss_enabled": cfg.improvement_loss_enabled,
         "mu": mu,
         "sd": sd,
         "residual_scale": residual_scale,
@@ -1630,6 +1774,8 @@ if SAVE_MODEL_BUNDLE:
         "dynamic_summary": dyn_summary,
         "dynamic_ab_table": dyn_ab_table.to_dict(orient="records"),
     }
+    if RUN_IMPROVEMENT_LOSS_ABLATION:
+        bundle["loss_ablation_table"] = loss_ablation_table.to_dict(orient="records")
     save_path = "milestone_ann_mppt_top3_rescue_bundle.pt"
     torch.save(bundle, save_path)
     print("\nSaved model bundle to:", save_path)
