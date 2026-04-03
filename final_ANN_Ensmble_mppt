@@ -988,6 +988,10 @@ def split_experimental_curves(exp_curves, frac=0.5, seed=7):
     rng.shuffle(idx)
 
     n_cal = int(len(valid) * frac)
+    if len(valid) >= 2:
+        n_cal = max(1, min(n_cal, len(valid) - 1))
+    else:
+        n_cal = min(n_cal, len(valid))
     cal_idx = idx[:n_cal]
     hold_idx = idx[n_cal:]
 
@@ -1623,7 +1627,34 @@ def evaluate_unseen_300(
             valid_indices.append(idx)
 
     if len(valid_indices) == 0:
-        raise RuntimeError("No valid unseen/test curves found after cleaning.")
+        empty_df = pd.DataFrame()
+        empty_summary = {
+            "n_eval_valid": 0,
+            "mean_ann_diff_pct": float("nan"),
+            "median_ann_diff_pct": float("nan"),
+            "max_ann_diff_pct": float("nan"),
+            "ann_within_5pct_rate": float("nan"),
+            "ann_pass_avg_diff_le_5pct": False,
+            "mean_coarse_diff_pct": float("nan"),
+            "ann_improvement_vs_coarse_pct_points": float("nan"),
+            "ann_beats_coarse_rate_pct": float("nan"),
+            "ann_equals_or_beats_coarse_rate_pct": float("nan"),
+            "mean_final_hybrid_vdiff_pct": float("nan"),
+            "max_final_hybrid_vdiff_pct": float("nan"),
+            "mean_final_ratio_pct": float("nan"),
+            "mean_tracking_eff_pct": float("nan"),
+            "mean_final_hybrid_power_regret_pct": float("nan"),
+            "fallback_rate_pct": float("nan"),
+            "ambiguous_case_rate_pct": float("nan"),
+            "uncertain_ann_rate_pct": float("nan"),
+            "trust_ann_rate_pct": None,
+            "dual_peak_rescue_rate_pct": float("nan"),
+            "top3_rescue_rate_pct": float("nan"),
+            "mean_episode_time_s": float("nan"),
+            "avg_eval_points_per_episode": float("nan"),
+            "avg_hold_time_fraction": float("nan"),
+        }
+        return empty_summary, empty_df, []
 
     eval_indices = valid_indices[:min(cfg.max_eval_curves, len(valid_indices))]
 
