@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
 from IPython.display import display
 
 try:
@@ -115,6 +116,19 @@ class Config:
     # evaluation
     max_eval_curves: int = 300
     n_viz: int = 8
+    exp_calibration_fraction: float = 0.5
+    trust_gate_enabled: bool = True
+    trust_gate_random_state: int = 7
+    trust_gate_min_prob: float = 0.60
+    trust_gate_use_features: Tuple[str, ...] = (
+        "ann_std_vhat",
+        "ann_shift_from_coarse",
+        "coarse_top_gap_ratio",
+        "ambiguity_flag",
+        "multi_peak_count",
+        "ensemble_range_vhat",
+    )
+    report_holdout_only: bool = True
 
     @property
     def sample_fracs(self) -> np.ndarray:
@@ -961,6 +975,103 @@ def run_targeted_rescue(
 
     return E, t, V_best, P_best
 
+def split_experimental_curves(exp_curves, frac=0.5, seed=7):
+    exp_list = np.asarray(exp_curves).ravel()
+    valid = []
+    for item in exp_list:
+        oracle = CurveOracle(item)
+        if oracle.voc > 0 and oracle.pmpp_true > 0:
+            valid.append(item)
+
+    rng = np.random.RandomState(seed)
+    idx = np.arange(len(valid))
+    rng.shuffle(idx)
+
+    n_cal = int(len(valid) * frac)
+    cal_idx = idx[:n_cal]
+    hold_idx = idx[n_cal:]
+
+    cal_curves = [valid[i] for i in cal_idx]
+    hold_curves = [valid[i] for i in hold_idx]
+    return np.array(cal_curves, dtype=object), np.array(hold_curves, dtype=object)
+
+def build_trust_gate_dataset(curves, models, mu, sd, residual_scale, cfg):
+    rows = []
+    for item in np.asarray(curves).ravel():
+        oracle = CurveOracle(item)
+        if oracle.voc <= 0 or oracle.pmpp_true <= 0:
+            continue
+
+        v, i = oracle.curve_for_plot()
+        feat = build_feature_vector(v, i, cfg.sample_fracs)
+
+        x_std = apply_standardizer(feat["x"][None, :], mu, sd)
+        coarse_best_vhat = float(feat["coarse_best_vhat"])
+        coarse_top_gap_ratio = float(feat["top_gap_ratio"])
+        ambiguity_flag = float(feat["ambiguity_flag"])
+        multi_peak_count = float(feat["multi_peak_count"])
+
+        ens = predict_vhat_ensemble(models, x_std, coarse_best_vhat, residual_scale, cfg.device)
+
+        ann_vhat = float(ens["mean_vhat"])
+        ann_std_vhat = float(ens["std_vhat"])
+        ensemble_range_vhat = float(ens["max_vhat"] - ens["min_vhat"])
+        ann_shift_from_coarse = abs(ann_vhat - coarse_best_vhat)
+
+        V_ann = float(np.clip(ann_vhat * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+        V_coarse = float(coarse_best_vhat * oracle.voc)
+
+        ann_err = abs(V_ann - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        coarse_err = abs(V_coarse - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        ann_beats_coarse = int(ann_err < coarse_err)
+
+        rows.append({
+            "ann_std_vhat": ann_std_vhat,
+            "ann_shift_from_coarse": ann_shift_from_coarse,
+            "coarse_top_gap_ratio": coarse_top_gap_ratio,
+            "ambiguity_flag": ambiguity_flag,
+            "multi_peak_count": multi_peak_count,
+            "ensemble_range_vhat": ensemble_range_vhat,
+            "ann_beats_coarse": ann_beats_coarse,
+            "ann_err_pct": 100.0 * ann_err,
+            "coarse_err_pct": 100.0 * coarse_err,
+        })
+
+    return pd.DataFrame(rows)
+
+def fit_trust_gate(cal_df, cfg):
+    feature_names = list(cfg.trust_gate_use_features)
+    X = cal_df[feature_names].values
+    y = cal_df["ann_beats_coarse"].values.astype(int)
+    model = LogisticRegression(
+        random_state=cfg.trust_gate_random_state,
+        max_iter=1000,
+        class_weight="balanced"
+    )
+    model.fit(X, y)
+    return model, feature_names
+
+def choose_trust_threshold(cal_df, gate_model, feature_names):
+    X = cal_df[feature_names].values
+    probs = gate_model.predict_proba(X)[:, 1]
+
+    best_thresh = 0.60
+    best_score = float("inf")
+
+    for thresh in np.linspace(0.50, 0.90, 17):
+        use_ann = probs >= thresh
+        selected_err = np.where(
+            use_ann,
+            cal_df["ann_err_pct"].values,
+            cal_df["coarse_err_pct"].values
+        )
+        score = selected_err.mean()
+        if score < best_score:
+            best_score = score
+            best_thresh = float(thresh)
+
+    return best_thresh, float(best_score)
+
 def predict_ann_stage_for_oracle(oracle: CurveOracle, models, mu, sd, residual_scale, cfg: Config):
     v, i = oracle.curve_for_plot()
     feat = build_feature_vector(v, i, cfg.sample_fracs)
@@ -980,6 +1091,66 @@ def predict_ann_stage_for_oracle(oracle: CurveOracle, models, mu, sd, residual_s
         "pred_vhat_std": float(ens["std_vhat"]),
         "pred_vhat_min": float(ens["min_vhat"]),
         "pred_vhat_max": float(ens["max_vhat"]),
+    }
+
+def predict_ann_stage_with_trust_gate(
+    oracle,
+    models,
+    mu,
+    sd,
+    residual_scale,
+    cfg,
+    gate_model=None,
+    gate_feature_names=None,
+    trust_threshold=None,
+):
+    v, i = oracle.curve_for_plot()
+    feat = build_feature_vector(v, i, cfg.sample_fracs)
+    x = feat["x"][None, :]
+    x_std = apply_standardizer(x, mu, sd)
+
+    coarse_best_vhat = float(feat["coarse_best_vhat"])
+    coarse_top_gap_ratio = float(feat["top_gap_ratio"])
+    ambiguity_flag = float(feat["ambiguity_flag"])
+    multi_peak_count = float(feat["multi_peak_count"])
+
+    ens = predict_vhat_ensemble(models, x_std, coarse_best_vhat, residual_scale, cfg.device)
+
+    ann_vhat = float(ens["mean_vhat"])
+    ann_std_vhat = float(ens["std_vhat"])
+    ensemble_range_vhat = float(ens["max_vhat"] - ens["min_vhat"])
+    ann_shift_from_coarse = abs(ann_vhat - coarse_best_vhat)
+
+    trust_prob = None
+    trust_ann = True
+
+    if cfg.trust_gate_enabled and gate_model is not None and gate_feature_names is not None and trust_threshold is not None:
+        feature_row = pd.DataFrame([{
+            "ann_std_vhat": ann_std_vhat,
+            "ann_shift_from_coarse": ann_shift_from_coarse,
+            "coarse_top_gap_ratio": coarse_top_gap_ratio,
+            "ambiguity_flag": ambiguity_flag,
+            "multi_peak_count": multi_peak_count,
+            "ensemble_range_vhat": ensemble_range_vhat,
+        }])[gate_feature_names].values
+
+        trust_prob = float(gate_model.predict_proba(feature_row)[0, 1])
+        trust_ann = bool(trust_prob >= trust_threshold)
+
+    chosen_vhat = ann_vhat if trust_ann else coarse_best_vhat
+    V_pred = float(np.clip(chosen_vhat * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+
+    return {
+        "feature": feat,
+        "V_pred": V_pred,
+        "P_pred": float(V_pred * oracle.measure(V_pred)),
+        "pred_vhat_mean": ann_vhat,
+        "pred_vhat_std": ann_std_vhat,
+        "pred_vhat_min": float(ens["min_vhat"]),
+        "pred_vhat_max": float(ens["max_vhat"]),
+        "trust_prob": trust_prob,
+        "trust_ann": trust_ann,
+        "coarse_best_vhat": coarse_best_vhat,
     }
 
 def get_runtime_tuning(cfg: Config) -> Dict[str, object]:
@@ -1004,6 +1175,9 @@ def run_global_gmppt_episode_logged(
     sd: np.ndarray,
     residual_scale: float,
     cfg: Config,
+    gate_model=None,
+    gate_feature_names=None,
+    trust_threshold=None,
 ):
     stats = StageStats()
     runtime = get_runtime_tuning(cfg)
@@ -1013,7 +1187,7 @@ def run_global_gmppt_episode_logged(
     enable_top3_rescue = bool(runtime["enable_top3_rescue"])
 
     if oracle.voc <= 0 or oracle.pmpp_true <= 0:
-        return {"eff": 0.0, "ratio": 0.0, "time": 0.0, "fallback": False}, {
+        return {"eff": 0.0, "ratio": 0.0, "time": 0.0, "fallback": False, "trust_ann": True}, {
             "Voc": 0.0,
             "Isc": 0.0,
             "coarse_V": [],
@@ -1037,6 +1211,8 @@ def run_global_gmppt_episode_logged(
             "V_third_coarse": 0.0,
             "P_third_coarse": 0.0,
             "mode": "global",
+            "log_trust_prob": None,
+            "log_trust_ann": True,
             "stage_stats": stats.__dict__.copy(),
             "total_probe_time": 0.0,
             "total_hold_time": 0.0,
@@ -1064,6 +1240,8 @@ def run_global_gmppt_episode_logged(
         "dual_peak_rescue_used": False,
         "top3_rescue_used": False,
         "mode": "global",
+        "log_trust_prob": None,
+        "log_trust_ann": True,
     }
 
     # 1) coarse sweep
@@ -1110,7 +1288,17 @@ def run_global_gmppt_episode_logged(
         stats.t_hold_total += hold_dt
 
     # 2) ANN stage
-    ann_info = predict_ann_stage_for_oracle(oracle, models, mu, sd, residual_scale, cfg)
+    ann_info = predict_ann_stage_with_trust_gate(
+        oracle,
+        models,
+        mu,
+        sd,
+        residual_scale,
+        cfg,
+        gate_model=gate_model,
+        gate_feature_names=gate_feature_names,
+        trust_threshold=trust_threshold,
+    )
     V_target = ann_info["V_pred"]
     P_target = ann_info["P_pred"]
     uncertain_ann = bool(ann_info["pred_vhat_std"] >= cfg.uncertainty_std_thresh)
@@ -1119,6 +1307,8 @@ def run_global_gmppt_episode_logged(
     log["P_target"] = P_target
     log["ann_pred_std_vhat"] = float(ann_info["pred_vhat_std"])
     log["uncertain_ann"] = uncertain_ann
+    log["log_trust_prob"] = ann_info["trust_prob"]
+    log["log_trust_ann"] = ann_info["trust_ann"]
 
     E, t = add_probe(E, t, P_target, cfg.dt_meas)
     stats.ann_points += 1
@@ -1271,6 +1461,7 @@ def run_global_gmppt_episode_logged(
         "uncertain_ann": log["uncertain_ann"],
         "dual_peak_rescue_used": log["dual_peak_rescue_used"],
         "top3_rescue_used": log["top3_rescue_used"],
+        "trust_ann": log["log_trust_ann"],
         "mode": "global",
         "total_probe_time": float(stats.t_probe_total),
         "total_hold_time": float(stats.t_hold_total),
@@ -1345,9 +1536,15 @@ def run_local_track_episode_logged(oracle: CurveOracle, state: RuntimeState, cfg
     }
     return result, log
 
-def run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scale, cfg):
+def run_supervisory_controller_step(
+    oracle, state, models, mu, sd, residual_scale, cfg,
+    gate_model=None, gate_feature_names=None, trust_threshold=None
+):
     if not state.initialized:
-        result, log = run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
+        result, log = run_global_gmppt_episode_logged(
+            oracle, models, mu, sd, residual_scale, cfg,
+            gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+        )
     else:
         v_observed = state.last_v_best
         p_observed = float(v_observed * oracle.measure(v_observed))
@@ -1358,7 +1555,10 @@ def run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scal
         if should_run_local:
             result, log = run_local_track_episode_logged(oracle, state, cfg)
         else:
-            result, log = run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
+            result, log = run_global_gmppt_episode_logged(
+                oracle, models, mu, sd, residual_scale, cfg,
+                gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+            )
 
     state.initialized = True
     state.last_v_best = log["V_best"]
@@ -1368,17 +1568,32 @@ def run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scal
     state.last_p_observed = state.last_p_best
     return result, log, state
 
-def run_hybrid_supervised_step(oracle, state, models, mu, sd, residual_scale, cfg):
-    result, log, state = run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scale, cfg)
+def run_hybrid_supervised_step(
+    oracle, state, models, mu, sd, residual_scale, cfg,
+    gate_model=None, gate_feature_names=None, trust_threshold=None
+):
+    result, log, state = run_supervisory_controller_step(
+        oracle, state, models, mu, sd, residual_scale, cfg,
+        gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+    )
     return result, log, state
 
-def run_hybrid_episode_logged(oracle: CurveOracle, models, mu: np.ndarray, sd: np.ndarray, residual_scale: float, cfg: Config):
-    return run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
+def run_hybrid_episode_logged(
+    oracle: CurveOracle, models, mu: np.ndarray, sd: np.ndarray, residual_scale: float, cfg: Config,
+    gate_model=None, gate_feature_names=None, trust_threshold=None
+):
+    return run_global_gmppt_episode_logged(
+        oracle, models, mu, sd, residual_scale, cfg,
+        gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+    )
 
 # -------------------------
 # EVALUATION
 # -------------------------
-def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config, controller_fn=run_hybrid_episode_logged):
+def evaluate_unseen_300(
+    exp_curves, models, mu, sd, residual_scale, cfg: Config, controller_fn=run_hybrid_episode_logged,
+    gate_model=None, gate_feature_names=None, trust_threshold=None
+):
     exp_list = np.asarray(exp_curves).ravel()
 
     valid_indices = []
@@ -1417,7 +1632,10 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
         ann_equals_or_beats_coarse = int(ann_err_abs <= coarse_err_abs)
         ann_power_regret_pct = 100.0 * max(oracle.pmpp_true - P_ann, 0.0) / (abs(oracle.pmpp_true) + 1e-9)
 
-        hybrid_res, hybrid_log = controller_fn(oracle, models, mu, sd, residual_scale, cfg)
+        hybrid_res, hybrid_log = controller_fn(
+            oracle, models, mu, sd, residual_scale, cfg,
+            gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+        )
         final_vdiff_pct = 100.0 * abs(hybrid_log["V_best"] - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         final_power_regret_pct = 100.0 * max(oracle.pmpp_true - hybrid_log["P_best"], 0.0) / (abs(oracle.pmpp_true) + 1e-9)
         stage_stats = hybrid_res.get("stage_stats", {})
@@ -1456,6 +1674,8 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
             "hold_time_fraction": hold_frac,
             "total_probe_time_s": float(hybrid_res.get("total_probe_time", 0.0)),
             "total_hold_time_s": float(hybrid_res.get("total_hold_time", 0.0)),
+            "trust_ann": hybrid_res.get("trust_ann", hybrid_log.get("log_trust_ann", None)),
+            "trust_prob": hybrid_log.get("log_trust_prob", None),
         })
 
         examples.append({
@@ -1479,6 +1699,11 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
         })
 
     df = pd.DataFrame(rows)
+    trust_ann_rate_pct = None
+    if "trust_ann" in df.columns:
+        trust_series = pd.to_numeric(df["trust_ann"], errors="coerce")
+        if trust_series.notna().any():
+            trust_ann_rate_pct = float(100.0 * trust_series.mean())
     summary = {
         "n_eval_valid": int(len(df)),
         "mean_ann_diff_pct": float(df["ann_diff_pct"].mean()),
@@ -1498,6 +1723,7 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config,
         "fallback_rate_pct": float(100.0 * df["fallback"].mean()),
         "ambiguous_case_rate_pct": float(100.0 * df["ambiguous_case"].mean()),
         "uncertain_ann_rate_pct": float(100.0 * df["uncertain_ann"].mean()),
+        "trust_ann_rate_pct": trust_ann_rate_pct,
         "dual_peak_rescue_rate_pct": float(100.0 * df["dual_peak_rescue_used"].mean()),
         "top3_rescue_rate_pct": float(100.0 * df["top3_rescue_used"].mean()),
         "mean_episode_time_s": float(df["episode_time_s"].mean()),
@@ -1563,14 +1789,20 @@ def evaluate_loss_ablation(exp_curves, dataset, cfg):
     ])
     return comp, baseline_df, improved_df, baseline_histories, improved_histories
 
-def evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, cfg):
+def evaluate_transition_sequences(
+    curve_sequence, models, mu, sd, residual_scale, cfg,
+    gate_model=None, gate_feature_names=None, trust_threshold=None
+):
     state = RuntimeState()
     rows = []
     for step_idx, curve in enumerate(curve_sequence):
         oracle = CurveOracle(curve)
         if oracle.voc <= 0 or oracle.pmpp_true <= 0:
             continue
-        result, log, state = run_hybrid_supervised_step(oracle, state, models, mu, sd, residual_scale, cfg)
+        result, log, state = run_hybrid_supervised_step(
+            oracle, state, models, mu, sd, residual_scale, cfg,
+            gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+        )
         rows.append({
             "step": step_idx,
             "mode": log["mode"],
@@ -1593,12 +1825,21 @@ def evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale
     }
     return summary, df
 
-def evaluate_transition_ab(curve_sequence, models, mu, sd, residual_scale, cfg: Config):
+def evaluate_transition_ab(
+    curve_sequence, models, mu, sd, residual_scale, cfg: Config,
+    gate_model=None, gate_feature_names=None, trust_threshold=None
+):
     baseline_cfg = Config(**cfg.__dict__)
     baseline_cfg.use_event_triggered_global = False
 
-    baseline_summary, baseline_df = evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, baseline_cfg)
-    supervised_summary, supervised_df = evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, cfg)
+    baseline_summary, baseline_df = evaluate_transition_sequences(
+        curve_sequence, models, mu, sd, residual_scale, baseline_cfg,
+        gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+    )
+    supervised_summary, supervised_df = evaluate_transition_sequences(
+        curve_sequence, models, mu, sd, residual_scale, cfg,
+        gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+    )
 
     comp = pd.DataFrame([
         {"controller": "global_every_step_baseline", **baseline_summary},
@@ -1717,11 +1958,40 @@ else:
     for i, loss in enumerate(best_losses, 1):
         print(f"  model {i}: {loss:.6f}")
 
-print("\nEvaluating on unseen test/experimental curves (static single-curve benchmark)...")
-summary, df_results, examples = evaluate_unseen_300(
-    exp_curves, models, mu, sd, residual_scale, cfg, controller_fn=run_global_gmppt_episode_logged
+exp_cal_curves, exp_hold_curves = split_experimental_curves(
+    exp_curves,
+    frac=cfg.exp_calibration_fraction,
+    seed=cfg.seed,
 )
-ab_table, baseline_df, optimized_df = evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg)
+
+print("\nFitting trust gate on experimental calibration split...")
+trust_gate_cal_df = build_trust_gate_dataset(
+    exp_cal_curves, models, mu, sd, residual_scale, cfg
+)
+trust_gate_model, trust_gate_feature_names = fit_trust_gate(trust_gate_cal_df, cfg)
+trust_threshold, trust_threshold_score = choose_trust_threshold(
+    trust_gate_cal_df,
+    trust_gate_model,
+    trust_gate_feature_names
+)
+
+print("\n=== TRUST GATE CALIBRATION SUMMARY ===")
+print(f"n_calibration_curves: {len(trust_gate_cal_df)}")
+print(f"chosen_trust_threshold: {trust_threshold:.3f}")
+print(f"calibration_selected_mean_err_pct: {trust_threshold_score:.4f}")
+
+print("\nEvaluating on final unseen experimental holdout curves...")
+eval_curves = exp_hold_curves if cfg.report_holdout_only else exp_curves
+summary, df_results, examples = evaluate_unseen_300(
+    eval_curves, models, mu, sd, residual_scale, cfg,
+    controller_fn=run_global_gmppt_episode_logged,
+    gate_model=trust_gate_model,
+    gate_feature_names=trust_gate_feature_names,
+    trust_threshold=trust_threshold,
+)
+ab_table, baseline_df, optimized_df = evaluate_static_ab(
+    eval_curves, models, mu, sd, residual_scale, cfg
+)
 
 exp_list = np.asarray(exp_curves).ravel()
 if len(exp_list) > 0:
@@ -1729,8 +1999,14 @@ if len(exp_list) > 0:
     take = min(8, len(exp_list))
     for k in range(take):
         seq.extend([exp_list[k], exp_list[k], exp_list[k]])
-    dyn_summary, dyn_df = evaluate_transition_sequences(seq, models, mu, sd, residual_scale, cfg)
-    dyn_ab_table, dyn_base_df, dyn_supervised_df = evaluate_transition_ab(seq, models, mu, sd, residual_scale, cfg)
+    dyn_summary, dyn_df = evaluate_transition_sequences(
+        seq, models, mu, sd, residual_scale, cfg,
+        gate_model=trust_gate_model, gate_feature_names=trust_gate_feature_names, trust_threshold=trust_threshold
+    )
+    dyn_ab_table, dyn_base_df, dyn_supervised_df = evaluate_transition_ab(
+        seq, models, mu, sd, residual_scale, cfg,
+        gate_model=trust_gate_model, gate_feature_names=trust_gate_feature_names, trust_threshold=trust_threshold
+    )
 else:
     dyn_summary, dyn_df = {"n_steps": 0}, pd.DataFrame()
     dyn_ab_table, dyn_base_df, dyn_supervised_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -1755,6 +2031,12 @@ print(f"ann_improvement_vs_coarse_pct_points: {summary['ann_improvement_vs_coars
 print(f"ann_beats_coarse_rate_pct: {summary['ann_beats_coarse_rate_pct']:.2f}")
 print(f"ann_equals_or_beats_coarse_rate_pct: {summary['ann_equals_or_beats_coarse_rate_pct']:.2f}")
 
+print("\n=== TRUST GATE REPORT ===")
+print(f"trust_ann_rate_pct: {summary['trust_ann_rate_pct']}")
+print(f"ann_beats_coarse_rate_pct: {summary['ann_beats_coarse_rate_pct']:.2f}")
+print(f"ann_equals_or_beats_coarse_rate_pct: {summary['ann_equals_or_beats_coarse_rate_pct']:.2f}")
+print(f"uncertain_ann_rate_pct: {summary['uncertain_ann_rate_pct']:.2f}")
+
 if MAKE_PLOTS:
     plot_training_histories(histories)
     visualize_examples(examples, n_viz=cfg.n_viz, seed=cfg.seed)
@@ -1773,6 +2055,10 @@ if SAVE_MODEL_BUNDLE:
         "static_ab_table": ab_table.to_dict(orient="records"),
         "dynamic_summary": dyn_summary,
         "dynamic_ab_table": dyn_ab_table.to_dict(orient="records"),
+        "trust_gate_enabled": cfg.trust_gate_enabled,
+        "trust_threshold": trust_threshold,
+        "trust_gate_feature_names": trust_gate_feature_names,
+        "trust_gate_calibration_rows": trust_gate_cal_df.to_dict(orient="records")[:200],
     }
     if RUN_IMPROVEMENT_LOSS_ABLATION:
         bundle["loss_ablation_table"] = loss_ablation_table.to_dict(orient="records")
@@ -1793,3 +2079,6 @@ print(
     f"{summary['dual_peak_rescue_rate_pct']:.2f}% of cases and top-3 rescue activated on "
     f"{summary['top3_rescue_rate_pct']:.2f}% of unseen cases."
 )
+
+print("\n=== FINAL INTERPRETATION ===")
+print("This experiment tests whether a domain-calibrated trust gate can reduce the sim-to-exp mismatch by using ANN only when it is likely to beat the coarse baseline on experimental-style data.")
