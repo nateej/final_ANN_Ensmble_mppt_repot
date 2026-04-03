@@ -997,6 +997,17 @@ def split_experimental_curves(exp_curves, frac=0.5, seed=7):
 
 def build_trust_gate_dataset(curves, models, mu, sd, residual_scale, cfg):
     rows = []
+    gate_columns = [
+        "ann_std_vhat",
+        "ann_shift_from_coarse",
+        "coarse_top_gap_ratio",
+        "ambiguity_flag",
+        "multi_peak_count",
+        "ensemble_range_vhat",
+        "ann_beats_coarse",
+        "ann_err_pct",
+        "coarse_err_pct",
+    ]
     for item in np.asarray(curves).ravel():
         oracle = CurveOracle(item)
         if oracle.voc <= 0 or oracle.pmpp_true <= 0:
@@ -1037,12 +1048,18 @@ def build_trust_gate_dataset(curves, models, mu, sd, residual_scale, cfg):
             "coarse_err_pct": 100.0 * coarse_err,
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=gate_columns)
 
 def fit_trust_gate(cal_df, cfg):
-    feature_names = list(cfg.trust_gate_use_features)
+    feature_names = [f for f in cfg.trust_gate_use_features if f in cal_df.columns]
+    if len(feature_names) == 0 or "ann_beats_coarse" not in cal_df.columns or len(cal_df) == 0:
+        return None, feature_names
+
     X = cal_df[feature_names].values
     y = cal_df["ann_beats_coarse"].values.astype(int)
+    if np.unique(y).size < 2:
+        return None, feature_names
+
     model = LogisticRegression(
         random_state=cfg.trust_gate_random_state,
         max_iter=1000,
@@ -1052,6 +1069,9 @@ def fit_trust_gate(cal_df, cfg):
     return model, feature_names
 
 def choose_trust_threshold(cal_df, gate_model, feature_names):
+    if gate_model is None or not feature_names:
+        return 0.60, float("nan")
+
     X = cal_df[feature_names].values
     probs = gate_model.predict_proba(X)[:, 1]
 
