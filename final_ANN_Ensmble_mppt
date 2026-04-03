@@ -1218,6 +1218,77 @@ def predict_ann_stage_with_trust_gate(
         "coarse_best_vhat": coarse_best_vhat,
     }
 
+def compute_raw_and_gated_predictions_for_oracle(
+    oracle,
+    models,
+    mu,
+    sd,
+    residual_scale,
+    cfg,
+    gate_model=None,
+    gate_feature_names=None,
+    trust_threshold=None,
+):
+    v, i = oracle.curve_for_plot()
+    feat = build_feature_vector(v, i, cfg.sample_fracs)
+    x = feat["x"][None, :]
+    x_std = apply_standardizer(x, mu, sd)
+
+    coarse_best_vhat = float(feat["coarse_best_vhat"])
+    coarse_top_gap_ratio = float(feat["top_gap_ratio"])
+    ambiguity_flag = float(feat["ambiguity_flag"])
+    multi_peak_count = float(feat["multi_peak_count"])
+
+    ens = predict_vhat_ensemble(models, x_std, coarse_best_vhat, residual_scale, cfg.device)
+
+    ann_vhat = float(ens["mean_vhat"])
+    ann_std_vhat = float(ens["std_vhat"])
+    ensemble_range_vhat = float(ens["max_vhat"] - ens["min_vhat"])
+    ann_shift_from_coarse = abs(ann_vhat - coarse_best_vhat)
+
+    trust_prob = None
+    trust_ann = True
+
+    if cfg.trust_gate_enabled and gate_model is not None and gate_feature_names is not None and trust_threshold is not None:
+        feature_row = pd.DataFrame([{
+            "ann_std_vhat": ann_std_vhat,
+            "ann_shift_from_coarse": ann_shift_from_coarse,
+            "coarse_top_gap_ratio": coarse_top_gap_ratio,
+            "ambiguity_flag": ambiguity_flag,
+            "multi_peak_count": multi_peak_count,
+            "ensemble_range_vhat": ensemble_range_vhat,
+        }])[gate_feature_names].values
+
+        trust_prob = float(gate_model.predict_proba(feature_row)[0, 1])
+        trust_ann = bool(trust_prob >= trust_threshold)
+
+    raw_ann_vhat = ann_vhat
+    coarse_vhat = coarse_best_vhat
+    chosen_vhat = raw_ann_vhat if trust_ann else coarse_vhat
+
+    V_raw_ann = float(np.clip(raw_ann_vhat * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    V_coarse = float(np.clip(coarse_vhat * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    V_gated = float(np.clip(chosen_vhat * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+
+    P_raw_ann = float(V_raw_ann * oracle.measure(V_raw_ann))
+    P_coarse = float(V_coarse * oracle.measure(V_coarse))
+    P_gated = float(V_gated * oracle.measure(V_gated))
+
+    return {
+        "V_raw_ann": V_raw_ann,
+        "P_raw_ann": P_raw_ann,
+        "V_coarse": V_coarse,
+        "P_coarse": P_coarse,
+        "V_gated": V_gated,
+        "P_gated": P_gated,
+        "trust_ann": trust_ann,
+        "trust_prob": trust_prob,
+        "ann_std_vhat": ann_std_vhat,
+        "raw_ann_vhat": raw_ann_vhat,
+        "coarse_vhat": coarse_vhat,
+        "gated_vhat": chosen_vhat,
+    }
+
 def get_runtime_tuning(cfg: Config) -> Dict[str, object]:
     if cfg.use_lean_global_runtime:
         return {
@@ -1671,6 +1742,9 @@ def evaluate_unseen_300(
         empty_df = pd.DataFrame(columns=[
             "curve_idx", "Voc", "V_true", "P_true", "V_coarse_best", "coarse_diff_pct",
             "V_ann", "ann_diff_pct", "ann_beats_coarse", "ann_equals_or_beats_coarse",
+            "V_gated_choice", "gated_choice_diff_pct", "gated_choice_power_regret_pct",
+            "gated_beats_coarse", "gated_equals_or_beats_coarse",
+            "gated_beats_raw_ann", "gated_equals_or_beats_raw_ann", "gated_choice_source",
             "ann_power_regret_pct", "ann_std_vhat", "V_final_hybrid",
             "final_hybrid_vdiff_pct", "final_hybrid_power_regret_pct", "final_ratio_pct",
             "tracking_eff_pct", "fallback", "ambiguous_case", "uncertain_ann",
@@ -1689,6 +1763,20 @@ def evaluate_unseen_300(
             "ann_improvement_vs_coarse_pct_points": float("nan"),
             "ann_beats_coarse_rate_pct": float("nan"),
             "ann_equals_or_beats_coarse_rate_pct": float("nan"),
+            "mean_gated_choice_diff_pct": float("nan"),
+            "median_gated_choice_diff_pct": float("nan"),
+            "max_gated_choice_diff_pct": float("nan"),
+            "gated_choice_within_5pct_rate": float("nan"),
+            "gated_choice_beats_coarse_rate_pct": float("nan"),
+            "gated_choice_equals_or_beats_coarse_rate_pct": float("nan"),
+            "gated_choice_beats_raw_ann_rate_pct": float("nan"),
+            "gated_choice_equals_or_beats_raw_ann_rate_pct": float("nan"),
+            "mean_gated_choice_power_regret_pct": float("nan"),
+            "trusted_ann_fraction_pct": float("nan"),
+            "trusted_subset_size": 0,
+            "coarse_subset_size": 0,
+            "trusted_ann_actual_beats_coarse_rate_pct": float("nan"),
+            "rejected_ann_would_have_beaten_coarse_rate_pct": float("nan"),
             "mean_final_hybrid_vdiff_pct": float("nan"),
             "max_final_hybrid_vdiff_pct": float("nan"),
             "mean_final_ratio_pct": float("nan"),
@@ -1713,25 +1801,34 @@ def evaluate_unseen_300(
 
     for idx in eval_indices:
         oracle = CurveOracle(exp_list[idx])
-        v, i = oracle.curve_for_plot()
-        feat = build_feature_vector(v, i, cfg.sample_fracs)
+        pred_info = compute_raw_and_gated_predictions_for_oracle(
+            oracle, models, mu, sd, residual_scale, cfg,
+            gate_model=gate_model,
+            gate_feature_names=gate_feature_names,
+            trust_threshold=trust_threshold,
+        )
 
-        x_std = apply_standardizer(feat["x"][None, :], mu, sd)
-        coarse_best_vhat = float(feat["coarse_best_vhat"])
-        ens = predict_vhat_ensemble(models, x_std, coarse_best_vhat, residual_scale, cfg.device)
-
-        V_ann = float(np.clip(ens["mean_vhat"] * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
-        P_ann = float(V_ann * oracle.measure(V_ann))
-        V_coarse_best = float(coarse_best_vhat * oracle.voc)
-        P_coarse_best = float(V_coarse_best * oracle.measure(V_coarse_best))
+        V_ann = pred_info["V_raw_ann"]
+        P_ann = pred_info["P_raw_ann"]
+        V_coarse_best = pred_info["V_coarse"]
+        P_coarse_best = pred_info["P_coarse"]
+        V_gated = pred_info["V_gated"]
+        P_gated = pred_info["P_gated"]
 
         ann_diff_pct = 100.0 * abs(V_ann - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         coarse_diff_pct = 100.0 * abs(V_coarse_best - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        gated_diff_pct = 100.0 * abs(V_gated - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         ann_err_abs = abs(V_ann - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         coarse_err_abs = abs(V_coarse_best - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
+        gated_err_abs = abs(V_gated - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         ann_beats_coarse = int(ann_err_abs < coarse_err_abs)
         ann_equals_or_beats_coarse = int(ann_err_abs <= coarse_err_abs)
+        gated_beats_coarse = int(gated_err_abs < coarse_err_abs)
+        gated_equals_or_beats_coarse = int(gated_err_abs <= coarse_err_abs)
+        gated_beats_raw_ann = int(gated_err_abs < ann_err_abs)
+        gated_equals_or_beats_raw_ann = int(gated_err_abs <= ann_err_abs)
         ann_power_regret_pct = 100.0 * max(oracle.pmpp_true - P_ann, 0.0) / (abs(oracle.pmpp_true) + 1e-9)
+        gated_power_regret_pct = 100.0 * max(oracle.pmpp_true - P_gated, 0.0) / (abs(oracle.pmpp_true) + 1e-9)
 
         hybrid_res, hybrid_log = controller_fn(
             oracle, models, mu, sd, residual_scale, cfg,
@@ -1757,8 +1854,16 @@ def evaluate_unseen_300(
             "ann_diff_pct": ann_diff_pct,
             "ann_beats_coarse": ann_beats_coarse,
             "ann_equals_or_beats_coarse": ann_equals_or_beats_coarse,
+            "V_gated_choice": V_gated,
+            "gated_choice_diff_pct": gated_diff_pct,
+            "gated_choice_power_regret_pct": gated_power_regret_pct,
+            "gated_beats_coarse": gated_beats_coarse,
+            "gated_equals_or_beats_coarse": gated_equals_or_beats_coarse,
+            "gated_beats_raw_ann": gated_beats_raw_ann,
+            "gated_equals_or_beats_raw_ann": gated_equals_or_beats_raw_ann,
+            "gated_choice_source": "ann" if pred_info["trust_ann"] else "coarse",
             "ann_power_regret_pct": ann_power_regret_pct,
-            "ann_std_vhat": float(ens["std_vhat"]),
+            "ann_std_vhat": float(pred_info["ann_std_vhat"]),
             "V_final_hybrid": float(hybrid_log["V_best"]),
             "final_hybrid_vdiff_pct": final_vdiff_pct,
             "final_hybrid_power_regret_pct": final_power_regret_pct,
@@ -1775,8 +1880,8 @@ def evaluate_unseen_300(
             "hold_time_fraction": hold_frac,
             "total_probe_time_s": float(hybrid_res.get("total_probe_time", 0.0)),
             "total_hold_time_s": float(hybrid_res.get("total_hold_time", 0.0)),
-            "trust_ann": hybrid_res.get("trust_ann", hybrid_log.get("log_trust_ann", None)),
-            "trust_prob": hybrid_log.get("log_trust_prob", None),
+            "trust_ann": pred_info["trust_ann"],
+            "trust_prob": pred_info["trust_prob"],
         })
 
         examples.append({
@@ -1816,6 +1921,18 @@ def evaluate_unseen_300(
         "ann_improvement_vs_coarse_pct_points": float(df["coarse_diff_pct"].mean() - df["ann_diff_pct"].mean()),
         "ann_beats_coarse_rate_pct": float(100.0 * df["ann_beats_coarse"].mean()),
         "ann_equals_or_beats_coarse_rate_pct": float(100.0 * df["ann_equals_or_beats_coarse"].mean()),
+        "mean_gated_choice_diff_pct": float(df["gated_choice_diff_pct"].mean()),
+        "median_gated_choice_diff_pct": float(df["gated_choice_diff_pct"].median()),
+        "max_gated_choice_diff_pct": float(df["gated_choice_diff_pct"].max()),
+        "gated_choice_within_5pct_rate": float(100.0 * (df["gated_choice_diff_pct"] <= 5.0).mean()),
+        "gated_choice_beats_coarse_rate_pct": float(100.0 * df["gated_beats_coarse"].mean()),
+        "gated_choice_equals_or_beats_coarse_rate_pct": float(100.0 * df["gated_equals_or_beats_coarse"].mean()),
+        "gated_choice_beats_raw_ann_rate_pct": float(100.0 * df["gated_beats_raw_ann"].mean()),
+        "gated_choice_equals_or_beats_raw_ann_rate_pct": float(100.0 * df["gated_equals_or_beats_raw_ann"].mean()),
+        "mean_gated_choice_power_regret_pct": float(df["gated_choice_power_regret_pct"].mean()),
+        "trusted_ann_fraction_pct": float(100.0 * (df["gated_choice_source"] == "ann").mean()),
+        "trusted_subset_size": int((df["gated_choice_source"] == "ann").sum()),
+        "coarse_subset_size": int((df["gated_choice_source"] == "coarse").sum()),
         "mean_final_hybrid_vdiff_pct": float(df["final_hybrid_vdiff_pct"].mean()),
         "max_final_hybrid_vdiff_pct": float(df["final_hybrid_vdiff_pct"].max()),
         "mean_final_ratio_pct": float(df["final_ratio_pct"].mean()),
@@ -1831,7 +1948,63 @@ def evaluate_unseen_300(
         "avg_eval_points_per_episode": float(df["n_eval_points"].mean()),
         "avg_hold_time_fraction": float(df["hold_time_fraction"].mean()),
     }
+    trusted_df = df[df["gated_choice_source"] == "ann"].copy()
+    rejected_df = df[df["gated_choice_source"] == "coarse"].copy()
+    summary["trusted_ann_actual_beats_coarse_rate_pct"] = (
+        float(100.0 * trusted_df["ann_beats_coarse"].mean()) if len(trusted_df) > 0 else float("nan")
+    )
+    summary["rejected_ann_would_have_beaten_coarse_rate_pct"] = (
+        float(100.0 * rejected_df["ann_beats_coarse"].mean()) if len(rejected_df) > 0 else float("nan")
+    )
     return summary, df, examples
+
+def build_predictor_comparison_table(summary):
+    return pd.DataFrame([
+        {
+            "predictor": "coarse",
+            "mean_diff_pct": summary["mean_coarse_diff_pct"],
+            "within_5pct_rate": None,
+            "beats_coarse_rate_pct": 100.0,
+            "power_regret_pct": None,
+        },
+        {
+            "predictor": "raw_ann",
+            "mean_diff_pct": summary["mean_ann_diff_pct"],
+            "within_5pct_rate": summary["ann_within_5pct_rate"],
+            "beats_coarse_rate_pct": summary["ann_beats_coarse_rate_pct"],
+            "power_regret_pct": None,
+        },
+        {
+            "predictor": "gated_choice",
+            "mean_diff_pct": summary["mean_gated_choice_diff_pct"],
+            "within_5pct_rate": summary["gated_choice_within_5pct_rate"],
+            "beats_coarse_rate_pct": summary["gated_choice_beats_coarse_rate_pct"],
+            "power_regret_pct": summary["mean_gated_choice_power_regret_pct"],
+        },
+    ])
+
+def evaluate_gated_threshold_sweep(
+    exp_curves, models, mu, sd, residual_scale, cfg,
+    gate_model, gate_feature_names,
+    thresholds=np.linspace(0.50, 0.90, 17),
+):
+    rows = []
+    for thr in thresholds:
+        summary, _, _ = evaluate_unseen_300(
+            exp_curves, models, mu, sd, residual_scale, cfg,
+            controller_fn=run_global_gmppt_episode_logged,
+            gate_model=gate_model,
+            gate_feature_names=gate_feature_names,
+            trust_threshold=float(thr),
+        )
+        rows.append({
+            "trust_threshold": float(thr),
+            "mean_gated_choice_diff_pct": summary["mean_gated_choice_diff_pct"],
+            "gated_choice_beats_coarse_rate_pct": summary["gated_choice_beats_coarse_rate_pct"],
+            "trusted_ann_fraction_pct": summary["trusted_ann_fraction_pct"],
+            "mean_episode_time_s": summary["mean_episode_time_s"],
+        })
+    return pd.DataFrame(rows)
 
 def evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg: Config):
     baseline_cfg = Config(**cfg.__dict__)
@@ -2115,6 +2288,16 @@ summary, df_results, examples = evaluate_unseen_300(
     gate_feature_names=trust_gate_feature_names,
     trust_threshold=trust_threshold,
 )
+predictor_comp = build_predictor_comparison_table(summary)
+gated_threshold_table = None
+if trust_gate_model is not None and trust_gate_feature_names is not None:
+    gated_threshold_table = evaluate_gated_threshold_sweep(
+        eval_curves, models, mu, sd, residual_scale, cfg,
+        gate_model=trust_gate_model,
+        gate_feature_names=trust_gate_feature_names,
+    )
+    print("\n=== GATED THRESHOLD SWEEP ===")
+    display(gated_threshold_table)
 ab_table, baseline_df, optimized_df = evaluate_static_ab(
     eval_curves, models, mu, sd, residual_scale, cfg
 )
@@ -2150,6 +2333,18 @@ display(dyn_ab_table)
 
 if len(df_results) > 0:
     display(df_results.head(10))
+    sanity_cols = [
+        "curve_idx",
+        "coarse_diff_pct",
+        "ann_diff_pct",
+        "gated_choice_diff_pct",
+        "ann_beats_coarse",
+        "gated_beats_coarse",
+        "gated_choice_source",
+        "trust_prob",
+    ]
+    print("\n=== GATED CHOICE SANITY CHECK ===")
+    display(df_results[sanity_cols].head(15))
 else:
     print("No holdout rows to display.")
 
@@ -2159,6 +2354,18 @@ print(f"mean_coarse_diff_pct: {summary['mean_coarse_diff_pct']:.4f}")
 print(f"ann_improvement_vs_coarse_pct_points: {summary['ann_improvement_vs_coarse_pct_points']:.4f}")
 print(f"ann_beats_coarse_rate_pct: {summary['ann_beats_coarse_rate_pct']:.2f}")
 print(f"ann_equals_or_beats_coarse_rate_pct: {summary['ann_equals_or_beats_coarse_rate_pct']:.2f}")
+
+print("\n=== GATED CHOICE REPORT ===")
+print(f"mean_gated_choice_diff_pct: {summary['mean_gated_choice_diff_pct']:.4f}")
+print(f"gated_choice_within_5pct_rate: {summary['gated_choice_within_5pct_rate']:.2f}")
+print(f"gated_choice_beats_coarse_rate_pct: {summary['gated_choice_beats_coarse_rate_pct']:.2f}")
+print(f"gated_choice_equals_or_beats_coarse_rate_pct: {summary['gated_choice_equals_or_beats_coarse_rate_pct']:.2f}")
+print(f"gated_choice_beats_raw_ann_rate_pct: {summary['gated_choice_beats_raw_ann_rate_pct']:.2f}")
+print(f"trusted_ann_fraction_pct: {summary['trusted_ann_fraction_pct']:.2f}")
+print(f"trusted_ann_actual_beats_coarse_rate_pct: {summary['trusted_ann_actual_beats_coarse_rate_pct']:.2f}")
+print(f"rejected_ann_would_have_beaten_coarse_rate_pct: {summary['rejected_ann_would_have_beaten_coarse_rate_pct']:.2f}")
+print("\n=== PREDICTOR COMPARISON TABLE ===")
+display(predictor_comp)
 
 print("\n=== TRUST GATE REPORT ===")
 print(f"trust_ann_rate_pct: {summary['trust_ann_rate_pct']}")
@@ -2184,11 +2391,14 @@ if SAVE_MODEL_BUNDLE:
         "static_ab_table": ab_table.to_dict(orient="records"),
         "dynamic_summary": dyn_summary,
         "dynamic_ab_table": dyn_ab_table.to_dict(orient="records"),
+        "predictor_comparison_table": predictor_comp.to_dict(orient="records"),
         "trust_gate_enabled": cfg.trust_gate_enabled,
         "trust_threshold": trust_threshold,
         "trust_gate_feature_names": trust_gate_feature_names,
         "trust_gate_calibration_rows": trust_gate_cal_df.to_dict(orient="records")[:200],
     }
+    if gated_threshold_table is not None:
+        bundle["gated_threshold_table"] = gated_threshold_table.to_dict(orient="records")
     if RUN_IMPROVEMENT_LOSS_ABLATION:
         bundle["loss_ablation_table"] = loss_ablation_table.to_dict(orient="records")
     save_path = "milestone_ann_mppt_top3_rescue_bundle.pt"
