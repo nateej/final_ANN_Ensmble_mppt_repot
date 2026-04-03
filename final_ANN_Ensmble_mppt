@@ -47,19 +47,23 @@ class Config:
     sample_fracs_max: float = 0.95
 
     # hybrid controller settings
-    widen_scan_steps: int = 10
+    widen_scan_steps: int = 5
     delta_local: float = 0.05
     shading_peak_threshold: int = 2
     dt_meas: float = 0.001
-    dt_hold: float = 0.050
-    max_refine_iterations: int = 10
+    dt_hold: float = 0.050  # backward compatibility (legacy path)
+    dt_hold_probe: float = 0.005
+    dt_hold_confirm: float = 0.020
+    confirm_gain_eps_ratio: float = 0.001
+    max_refine_iterations: int = 4
+    min_refine_gain_ratio: float = 0.002
 
     # ambiguity / rescue logic
     ambiguity_power_gap_pct: float = 0.05
     ambiguity_min_voltage_gap_frac: float = 0.08
     uncertainty_std_thresh: float = 0.035
 
-    dual_rescue_offsets: Tuple[float, ...] = (-0.06, -0.03, 0.0, 0.03, 0.06)
+    dual_rescue_offsets: Tuple[float, ...] = (-0.03, 0.0, 0.03)
     top3_rescue_offsets: Tuple[float, ...] = (-0.10, -0.06, -0.03, 0.0, 0.03, 0.06, 0.10)
 
     rescue_use_second_peak: bool = True
@@ -67,9 +71,17 @@ class Config:
     enable_targeted_fallback_first: bool = True
 
     # NEW: top-3 rare-case rescue
-    enable_top3_rescue: bool = True
+    enable_top3_rescue: bool = False
     top3_localmax_threshold: int = 3
     top3_trigger_power_ratio: float = 0.97
+    fallback_power_ratio_thresh: float = 0.96
+
+    use_adaptive_hold: bool = True
+    use_event_triggered_global: bool = True
+    use_lean_global_runtime: bool = True
+    event_trigger_power_delta_ratio: float = 0.02
+    event_trigger_voltage_delta_ratio: float = 0.015
+    local_track_delta_ratio: float = 0.01
 
     # training
     val_split: float = 0.15
@@ -744,11 +756,39 @@ def predict_vhat_ensemble(models: List[nn.Module], x_std: np.ndarray, coarse_bes
 # -------------------------
 # HYBRID CONTROLLER
 # -------------------------
+@dataclass
+class StageStats:
+    coarse_points: int = 0
+    ann_points: int = 0
+    refine_points: int = 0
+    dual_rescue_points: int = 0
+    top3_rescue_points: int = 0
+    fallback_targeted_points: int = 0
+    fallback_wide_points: int = 0
+    t_probe_total: float = 0.0
+    t_hold_total: float = 0.0
+
+@dataclass
+class RuntimeState:
+    initialized: bool = False
+    last_v_best: float = 0.0
+    last_p_best: float = 0.0
+    last_mode: str = "global"
+
 def add_probe(E: float, t: float, P: float, dt: float) -> Tuple[float, float]:
     return E + P * dt, t + dt
 
 def add_hold(E: float, t: float, P: float, dt: float) -> Tuple[float, float]:
     return E + P * dt, t + dt
+
+def add_adaptive_hold(E: float, t: float, p_before: float, p_after: float, cfg: Config):
+    if not cfg.use_adaptive_hold:
+        E, t = add_hold(E, t, p_after, cfg.dt_hold)
+        return E, t, cfg.dt_hold
+    improved = p_after > p_before * (1.0 + cfg.confirm_gain_eps_ratio)
+    hold_dt = cfg.dt_hold_confirm if improved else cfg.dt_hold_probe
+    E, t = add_hold(E, t, p_after, hold_dt)
+    return E, t, hold_dt
 
 def evaluate_point(oracle: CurveOracle, vq: float) -> Tuple[float, float]:
     vq = float(np.clip(vq, 0.0, oracle.voc))
@@ -812,6 +852,7 @@ def run_targeted_rescue(
     V_best: float,
     P_best: float,
     tag: str,
+    stats: StageStats,
 ):
     visited = set()
     for center in candidate_centers:
@@ -824,12 +865,21 @@ def run_targeted_rescue(
 
             v_eval, p_eval = evaluate_point(oracle, vq)
             E, t = add_probe(E, t, p_eval, cfg.dt_meas)
+            stats.t_probe_total += cfg.dt_meas
+            if tag == "dual_peak_rescue":
+                stats.dual_rescue_points += 1
+            elif tag == "top3_rescue":
+                stats.top3_rescue_points += 1
+            elif tag == "fallback_targeted":
+                stats.fallback_targeted_points += 1
             log["meas_V"].append(float(v_eval))
             log["meas_P"].append(float(p_eval))
             log["meas_tag"].append(tag)
 
+            p_before = P_best
             V_best, P_best, _ = maybe_update_best(v_eval, p_eval, V_best, P_best)
-            E, t = add_hold(E, t, P_best, cfg.dt_hold)
+            E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+            stats.t_hold_total += hold_dt
 
     return E, t, V_best, P_best
 
@@ -854,7 +904,7 @@ def predict_ann_stage_for_oracle(oracle: CurveOracle, models, mu, sd, residual_s
         "pred_vhat_max": float(ens["max_vhat"]),
     }
 
-def run_hybrid_episode_logged(
+def run_global_gmppt_episode_logged(
     oracle: CurveOracle,
     models,
     mu: np.ndarray,
@@ -862,6 +912,7 @@ def run_hybrid_episode_logged(
     residual_scale: float,
     cfg: Config,
 ):
+    stats = StageStats()
     if oracle.voc <= 0 or oracle.pmpp_true <= 0:
         return {"eff": 0.0, "ratio": 0.0, "time": 0.0, "fallback": False}, {
             "Voc": 0.0,
@@ -886,6 +937,10 @@ def run_hybrid_episode_logged(
             "P_second_coarse": 0.0,
             "V_third_coarse": 0.0,
             "P_third_coarse": 0.0,
+            "mode": "global",
+            "stage_stats": stats.__dict__.copy(),
+            "total_probe_time": 0.0,
+            "total_hold_time": 0.0,
         }
 
     Voc = oracle.voc
@@ -893,7 +948,8 @@ def run_hybrid_episode_logged(
 
     V_best = 0.80 * Voc
     P_best = V_best * oracle.measure(V_best)
-    E, t = add_hold(0.0, 0.0, P_best, cfg.dt_hold)
+    E, t, hold_dt = add_adaptive_hold(0.0, 0.0, P_best, P_best, cfg)
+    stats.t_hold_total += hold_dt
 
     log = {
         "Voc": Voc,
@@ -908,6 +964,7 @@ def run_hybrid_episode_logged(
         "uncertain_ann": False,
         "dual_peak_rescue_used": False,
         "top3_rescue_used": False,
+        "mode": "global",
     }
 
     # 1) coarse sweep
@@ -943,11 +1000,15 @@ def run_hybrid_episode_logged(
 
     for vq, pq in zip(V_coarse, P_coarse):
         E, t = add_probe(E, t, float(pq), cfg.dt_meas)
+        stats.coarse_points += 1
+        stats.t_probe_total += cfg.dt_meas
         log["meas_V"].append(float(vq))
         log["meas_P"].append(float(pq))
         log["meas_tag"].append("coarse")
+        p_before = P_best
         V_best, P_best, _ = maybe_update_best(float(vq), float(pq), V_best, P_best)
-        E, t = add_hold(E, t, P_best, cfg.dt_hold)
+        E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+        stats.t_hold_total += hold_dt
 
     # 2) ANN stage
     ann_info = predict_ann_stage_for_oracle(oracle, models, mu, sd, residual_scale, cfg)
@@ -961,15 +1022,20 @@ def run_hybrid_episode_logged(
     log["uncertain_ann"] = uncertain_ann
 
     E, t = add_probe(E, t, P_target, cfg.dt_meas)
+    stats.ann_points += 1
+    stats.t_probe_total += cfg.dt_meas
     log["meas_V"].append(float(V_target))
     log["meas_P"].append(float(P_target))
     log["meas_tag"].append("ann")
+    p_before = P_best
     V_best, P_best, _ = maybe_update_best(V_target, P_target, V_best, P_best)
-    E, t = add_hold(E, t, P_best, cfg.dt_hold)
+    E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+    stats.t_hold_total += hold_dt
 
     # 3) local refine
     delta = cfg.delta_local
     for _ in range(cfg.max_refine_iterations):
+        p_round_start = P_best
         improved = False
         candidates = [
             float(np.clip(V_best * (1.0 - delta), cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc)),
@@ -978,13 +1044,20 @@ def run_hybrid_episode_logged(
         for vq in candidates:
             pq = vq * oracle.measure(vq)
             E, t = add_probe(E, t, pq, cfg.dt_meas)
+            stats.refine_points += 1
+            stats.t_probe_total += cfg.dt_meas
             log["meas_V"].append(float(vq))
             log["meas_P"].append(float(pq))
             log["meas_tag"].append("local_refine")
             old_p = P_best
             V_best, P_best, better = maybe_update_best(float(vq), float(pq), V_best, P_best)
             improved = improved or better or (P_best > old_p)
-            E, t = add_hold(E, t, P_best, cfg.dt_hold)
+            E, t, hold_dt = add_adaptive_hold(E, t, old_p, P_best, cfg)
+            stats.t_hold_total += hold_dt
+
+        round_gain = (P_best - p_round_start) / max(p_round_start, 1e-9)
+        if round_gain < cfg.min_refine_gain_ratio:
+            break
 
         if not improved:
             if delta > 0.0125:
@@ -1012,6 +1085,7 @@ def run_hybrid_episode_logged(
             V_best=V_best,
             P_best=P_best,
             tag="dual_peak_rescue",
+            stats=stats,
         )
 
     # 5) NEW: top-3 rare-case rescue
@@ -1041,16 +1115,12 @@ def run_hybrid_episode_logged(
             V_best=V_best,
             P_best=P_best,
             tag="top3_rescue",
+            stats=stats,
         )
 
     # 6) fallback safety logic
-    weak_vs_coarse = P_best < 0.90 * coarse_best
-    fallback_trigger = (
-        ambiguous_case
-        or uncertain_ann
-        or count_local_maxima(P_coarse, noise_tolerance=0.02) >= cfg.shading_peak_threshold
-        or weak_vs_coarse
-    )
+    weak_vs_coarse = P_best < cfg.fallback_power_ratio_thresh * coarse_best
+    fallback_trigger = weak_vs_coarse or (ambiguous_case and uncertain_ann)
 
     if fallback_trigger:
         log["fallback"] = True
@@ -1068,20 +1138,30 @@ def run_hybrid_episode_logged(
                 V_best=V_best,
                 P_best=P_best,
                 tag="fallback_targeted",
+                stats=stats,
             )
 
-        for frac in np.linspace(0.15, 0.90, cfg.widen_scan_steps):
-            vq = float(frac * Voc)
-            pq = vq * oracle.measure(vq)
-            E, t = add_probe(E, t, pq, cfg.dt_meas)
-            log["meas_V"].append(float(vq))
-            log["meas_P"].append(float(pq))
-            log["meas_tag"].append("fallback_wide")
-            V_best, P_best, _ = maybe_update_best(vq, pq, V_best, P_best)
-            E, t = add_hold(E, t, P_best, cfg.dt_hold)
+        if P_best < cfg.fallback_power_ratio_thresh * coarse_best:
+            for frac in np.linspace(0.15, 0.90, cfg.widen_scan_steps):
+                vq = float(frac * Voc)
+                pq = vq * oracle.measure(vq)
+                E, t = add_probe(E, t, pq, cfg.dt_meas)
+                stats.fallback_wide_points += 1
+                stats.t_probe_total += cfg.dt_meas
+                log["meas_V"].append(float(vq))
+                log["meas_P"].append(float(pq))
+                log["meas_tag"].append("fallback_wide")
+                p_before = P_best
+                V_best, P_best, _ = maybe_update_best(vq, pq, V_best, P_best)
+                E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+                stats.t_hold_total += hold_dt
 
     log["V_best"] = V_best
     log["P_best"] = P_best
+    log["stage_stats"] = stats.__dict__.copy()
+    log["total_probe_time"] = float(stats.t_probe_total)
+    log["total_hold_time"] = float(stats.t_hold_total)
+    log["episode_time"] = float(t)
 
     result = {
         "eff": E / (oracle.pmpp_true * t + 1e-12),
@@ -1092,13 +1172,108 @@ def run_hybrid_episode_logged(
         "uncertain_ann": log["uncertain_ann"],
         "dual_peak_rescue_used": log["dual_peak_rescue_used"],
         "top3_rescue_used": log["top3_rescue_used"],
+        "mode": "global",
+        "total_probe_time": float(stats.t_probe_total),
+        "total_hold_time": float(stats.t_hold_total),
+        "stage_stats": stats.__dict__.copy(),
     }
     return result, log
+
+def shading_change_detected(p_now, p_prev, v_now, v_prev, cfg):
+    dP = abs(p_now - p_prev) / max(abs(p_prev), 1e-9)
+    dV = abs(v_now - v_prev) / max(abs(v_prev), 1e-9)
+    return (dP >= cfg.event_trigger_power_delta_ratio or dV >= cfg.event_trigger_voltage_delta_ratio)
+
+def run_local_track_episode_logged(oracle: CurveOracle, state: RuntimeState, cfg: Config):
+    stats = StageStats()
+    Voc = oracle.voc
+    V_center = float(np.clip(state.last_v_best, cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc))
+    candidates = [
+        float(np.clip(V_center * (1.0 - cfg.local_track_delta_ratio), cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc)),
+        V_center,
+        float(np.clip(V_center * (1.0 + cfg.local_track_delta_ratio), cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc)),
+    ]
+    E, t = 0.0, 0.0
+    V_best = V_center
+    P_best = V_center * oracle.measure(V_center)
+    for vq in candidates:
+        pq = vq * oracle.measure(vq)
+        E, t = add_probe(E, t, pq, cfg.dt_meas)
+        stats.refine_points += 1
+        stats.t_probe_total += cfg.dt_meas
+        p_before = P_best
+        V_best, P_best, _ = maybe_update_best(vq, pq, V_best, P_best)
+        E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+        stats.t_hold_total += hold_dt
+
+    # one optional extra local check
+    probe_v = float(np.clip(V_best * (1.0 + 0.5 * cfg.local_track_delta_ratio), cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc))
+    probe_p = probe_v * oracle.measure(probe_v)
+    gain_ratio = (probe_p - P_best) / max(P_best, 1e-9)
+    if gain_ratio >= cfg.min_refine_gain_ratio:
+        E, t = add_probe(E, t, probe_p, cfg.dt_meas)
+        stats.refine_points += 1
+        stats.t_probe_total += cfg.dt_meas
+        p_before = P_best
+        V_best, P_best, _ = maybe_update_best(probe_v, probe_p, V_best, P_best)
+        E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+        stats.t_hold_total += hold_dt
+
+    log = {
+        "mode": "local",
+        "fallback": False,
+        "dual_peak_rescue_used": False,
+        "top3_rescue_used": False,
+        "V_best": float(V_best),
+        "P_best": float(P_best),
+        "stage_stats": stats.__dict__.copy(),
+        "total_probe_time": float(stats.t_probe_total),
+        "total_hold_time": float(stats.t_hold_total),
+        "episode_time": float(t),
+    }
+    result = {
+        "eff": E / (oracle.pmpp_true * t + 1e-12),
+        "ratio": P_best / (oracle.pmpp_true + 1e-12),
+        "time": t,
+        "fallback": False,
+        "ambiguous_case": False,
+        "uncertain_ann": False,
+        "dual_peak_rescue_used": False,
+        "top3_rescue_used": False,
+        "mode": "local",
+        "total_probe_time": float(stats.t_probe_total),
+        "total_hold_time": float(stats.t_hold_total),
+        "stage_stats": stats.__dict__.copy(),
+    }
+    return result, log
+
+def run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scale, cfg):
+    if not state.initialized:
+        result, log = run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
+    else:
+        v_prev = state.last_v_best
+        i_prev = oracle.measure(v_prev)
+        p_now = v_prev * i_prev
+        if cfg.use_event_triggered_global and not shading_change_detected(
+            p_now, state.last_p_best, v_prev, state.last_v_best, cfg
+        ):
+            result, log = run_local_track_episode_logged(oracle, state, cfg)
+        else:
+            result, log = run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
+
+    state.initialized = True
+    state.last_v_best = log["V_best"]
+    state.last_p_best = log["P_best"]
+    state.last_mode = log["mode"]
+    return result, log, state
+
+def run_hybrid_episode_logged(oracle: CurveOracle, models, mu: np.ndarray, sd: np.ndarray, residual_scale: float, cfg: Config):
+    return run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
 
 # -------------------------
 # EVALUATION
 # -------------------------
-def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config):
+def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config, controller_fn=run_hybrid_episode_logged):
     exp_list = np.asarray(exp_curves).ravel()
 
     valid_indices = []
@@ -1133,9 +1308,15 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config)
         coarse_diff_pct = 100.0 * abs(V_coarse_best - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         ann_power_regret_pct = 100.0 * max(oracle.pmpp_true - P_ann, 0.0) / (abs(oracle.pmpp_true) + 1e-9)
 
-        hybrid_res, hybrid_log = run_hybrid_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
+        hybrid_res, hybrid_log = controller_fn(oracle, models, mu, sd, residual_scale, cfg)
         final_vdiff_pct = 100.0 * abs(hybrid_log["V_best"] - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         final_power_regret_pct = 100.0 * max(oracle.pmpp_true - hybrid_log["P_best"], 0.0) / (abs(oracle.pmpp_true) + 1e-9)
+        stage_stats = hybrid_res.get("stage_stats", {})
+        total_points = int(sum(stage_stats.get(k, 0) for k in [
+            "coarse_points", "ann_points", "refine_points", "dual_rescue_points",
+            "top3_rescue_points", "fallback_targeted_points", "fallback_wide_points"
+        ]))
+        hold_frac = float(hybrid_res.get("total_hold_time", 0.0) / max(hybrid_res["time"], 1e-12))
 
         rows.append({
             "curve_idx": int(idx),
@@ -1159,6 +1340,11 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config)
             "dual_peak_rescue_used": int(hybrid_res["dual_peak_rescue_used"]),
             "top3_rescue_used": int(hybrid_res["top3_rescue_used"]),
             "episode_time_s": float(hybrid_res["time"]),
+            "mode": hybrid_res.get("mode", "global"),
+            "n_eval_points": total_points,
+            "hold_time_fraction": hold_frac,
+            "total_probe_time_s": float(hybrid_res.get("total_probe_time", 0.0)),
+            "total_hold_time_s": float(hybrid_res.get("total_hold_time", 0.0)),
         })
 
         examples.append({
@@ -1202,8 +1388,60 @@ def evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg: Config)
         "dual_peak_rescue_rate_pct": float(100.0 * df["dual_peak_rescue_used"].mean()),
         "top3_rescue_rate_pct": float(100.0 * df["top3_rescue_used"].mean()),
         "mean_episode_time_s": float(df["episode_time_s"].mean()),
+        "avg_eval_points_per_episode": float(df["n_eval_points"].mean()),
+        "avg_hold_time_fraction": float(df["hold_time_fraction"].mean()),
     }
     return summary, df, examples
+
+def evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg: Config):
+    baseline_cfg = Config(**cfg.__dict__)
+    baseline_cfg.use_adaptive_hold = False
+    baseline_cfg.use_lean_global_runtime = False
+    baseline_cfg.enable_top3_rescue = True
+    baseline_cfg.max_refine_iterations = 10
+    baseline_cfg.dual_rescue_offsets = (-0.06, -0.03, 0.0, 0.03, 0.06)
+    baseline_cfg.widen_scan_steps = 10
+    baseline_summary, baseline_df, _ = evaluate_unseen_300(
+        exp_curves, models, mu, sd, residual_scale, baseline_cfg, controller_fn=run_global_gmppt_episode_logged
+    )
+    opt_summary, opt_df, _ = evaluate_unseen_300(
+        exp_curves, models, mu, sd, residual_scale, cfg, controller_fn=run_global_gmppt_episode_logged
+    )
+    comp = pd.DataFrame([
+        {"controller": "baseline", **baseline_summary},
+        {"controller": "optimized", **opt_summary},
+    ])
+    return comp, baseline_df, opt_df
+
+def evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, cfg):
+    state = RuntimeState()
+    rows = []
+    for step_idx, curve in enumerate(curve_sequence):
+        oracle = CurveOracle(curve)
+        if oracle.voc <= 0 or oracle.pmpp_true <= 0:
+            continue
+        result, log, state = run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scale, cfg)
+        rows.append({
+            "step": step_idx,
+            "mode": log["mode"],
+            "step_time_s": float(result["time"]),
+            "tracking_eff": float(result["eff"]),
+            "final_ratio": float(result["ratio"]),
+        })
+    if len(rows) == 0:
+        return {"n_steps": 0}, pd.DataFrame()
+    df = pd.DataFrame(rows)
+    summary = {
+        "n_steps": int(len(df)),
+        "local_mode_fraction": float((df["mode"] == "local").mean()),
+        "global_mode_fraction": float((df["mode"] == "global").mean()),
+        "mean_step_time_s": float(df["step_time_s"].mean()),
+        "p95_step_time_s": float(df["step_time_s"].quantile(0.95)),
+        "worst_step_time_s": float(df["step_time_s"].max()),
+        "energy_weighted_tracking_eff": float(np.average(df["tracking_eff"], weights=np.maximum(df["step_time_s"], 1e-9))),
+        "recovery_quality_after_transitions": float(df["final_ratio"].mean()),
+    }
+    return summary, df
 
 # -------------------------
 # PLOTS
@@ -1301,11 +1539,27 @@ print("\nBest validation loss per model:")
 for i, loss in enumerate(best_losses, 1):
     print(f"  model {i}: {loss:.6f}")
 
-print("\nEvaluating on unseen test/experimental curves...")
+print("\nEvaluating on unseen test/experimental curves (optimized controller)...")
 summary, df_results, examples = evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg)
+ab_table, baseline_df, optimized_df = evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg)
+
+exp_list = np.asarray(exp_curves).ravel()
+if len(exp_list) > 0:
+    seq = []
+    take = min(8, len(exp_list))
+    for k in range(take):
+        seq.extend([exp_list[k], exp_list[k], exp_list[k]])
+    dyn_summary, dyn_df = evaluate_transition_sequences(seq, models, mu, sd, residual_scale, cfg)
+else:
+    dyn_summary, dyn_df = {"n_steps": 0}, pd.DataFrame()
 
 print("\n=== UNSEEN TEST SUMMARY ===")
 for k, v in summary.items():
+    print(f"{k}: {v}")
+print("\n=== STATIC A/B SUMMARY (baseline vs optimized) ===")
+display(ab_table)
+print("\n=== DYNAMIC SEQUENCE SUMMARY ===")
+for k, v in dyn_summary.items():
     print(f"{k}: {v}")
 
 display(df_results.head(10))
@@ -1324,6 +1578,8 @@ if SAVE_MODEL_BUNDLE:
         "state_dicts": [m.state_dict() for m in models],
         "preprocess_stats": preprocess_stats,
         "summary": summary,
+        "static_ab_table": ab_table.to_dict(orient="records"),
+        "dynamic_summary": dyn_summary,
     }
     save_path = "milestone_ann_mppt_top3_rescue_bundle.pt"
     torch.save(bundle, save_path)
@@ -1332,13 +1588,13 @@ if SAVE_MODEL_BUNDLE:
 print("\nPresentation-ready result:")
 print(
     f"We kept the same 12 ANN sample points and retained residual ANN prediction, local refinement, "
-    f"dual-peak rescue, and fallback scanning, while adding a conditional top-3 rescue stage for rare "
-    f"multi-peak outliers. On {summary['n_eval_valid']} unseen test curves, the ANN stage achieved an "
+    f"deterministic rescue, and fallback scanning while adding adaptive hold and supervisory local/global runtime. "
+    f"On {summary['n_eval_valid']} unseen test curves, the ANN stage achieved an "
     f"average MPPT-voltage difference of {summary['mean_ann_diff_pct']:.3f}% relative to the true GMPP voltage, "
     f"and the final hybrid controller achieved an average final voltage difference of "
     f"{summary['mean_final_hybrid_vdiff_pct']:.3f}%, average final power ratio of "
     f"{summary['mean_final_ratio_pct']:.2f}%, and average tracking efficiency of "
     f"{summary['mean_tracking_eff_pct']:.2f}%. The dual-peak rescue activated on "
-    f"{summary['dual_peak_rescue_rate_pct']:.2f}% of cases, and the new top-3 rescue activated on "
+    f"{summary['dual_peak_rescue_rate_pct']:.2f}% of cases and top-3 rescue activated on "
     f"{summary['top3_rescue_rate_pct']:.2f}% of unseen cases."
 )
