@@ -206,6 +206,46 @@ def load_dataset(path: str):
         return load_curves_from_mat(path)
     raise ValueError("Dataset must be .npz or .mat")
 
+def iter_curve_items(curves):
+    """
+    Yield full curve objects without shredding homogeneous containers into fragments.
+    Supports:
+    - Python lists of curves
+    - object arrays of curves
+    - homogeneous arrays with shape (N, 2, M) or (N, M, 2)
+    - single curves with shape (2, M) or (M, 2)
+    """
+    if isinstance(curves, list):
+        for item in curves:
+            yield item
+        return
+
+    if isinstance(curves, tuple):
+        for item in curves:
+            yield item
+        return
+
+    arr = np.asarray(curves, dtype=object)
+
+    if arr.ndim == 0:
+        yield arr.item()
+        return
+
+    # Batched homogeneous curves: (N, 2, M) or (N, M, 2)
+    if arr.ndim >= 3 and (arr.shape[-2] == 2 or arr.shape[-1] == 2):
+        for k in range(arr.shape[0]):
+            yield np.asarray(arr[k], dtype=float)
+        return
+
+    # Single curve: (2, M) or (M, 2)
+    if arr.ndim == 2 and (arr.shape[0] == 2 or arr.shape[1] == 2):
+        yield np.asarray(arr, dtype=float)
+        return
+
+    # 1-D object containers
+    for item in arr.ravel():
+        yield item
+
 def extract_vi(curve) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     if curve is None:
         return None, None
@@ -976,9 +1016,8 @@ def run_targeted_rescue(
     return E, t, V_best, P_best
 
 def split_experimental_curves(exp_curves, frac=0.5, seed=7):
-    exp_list = np.asarray(exp_curves).ravel()
     valid = []
-    for item in exp_list:
+    for item in iter_curve_items(exp_curves):
         oracle = CurveOracle(item)
         if oracle.voc > 0 and oracle.pmpp_true > 0:
             valid.append(item)
@@ -997,7 +1036,9 @@ def split_experimental_curves(exp_curves, frac=0.5, seed=7):
 
     cal_curves = [valid[i] for i in cal_idx]
     hold_curves = [valid[i] for i in hold_idx]
-    return np.array(cal_curves, dtype=object), np.array(hold_curves, dtype=object)
+
+    # IMPORTANT: return plain Python lists, NOT np.array(..., dtype=object)
+    return cal_curves, hold_curves
 
 def build_trust_gate_dataset(curves, models, mu, sd, residual_scale, cfg):
     rows = []
@@ -1012,7 +1053,7 @@ def build_trust_gate_dataset(curves, models, mu, sd, residual_scale, cfg):
         "ann_err_pct",
         "coarse_err_pct",
     ]
-    for item in np.asarray(curves).ravel():
+    for item in iter_curve_items(curves):
         oracle = CurveOracle(item)
         if oracle.voc <= 0 or oracle.pmpp_true <= 0:
             continue
@@ -1618,7 +1659,7 @@ def evaluate_unseen_300(
     exp_curves, models, mu, sd, residual_scale, cfg: Config, controller_fn=run_hybrid_episode_logged,
     gate_model=None, gate_feature_names=None, trust_threshold=None
 ):
-    exp_list = np.asarray(exp_curves).ravel()
+    exp_list = list(iter_curve_items(exp_curves))
 
     valid_indices = []
     for idx, item in enumerate(exp_list):
@@ -1627,7 +1668,16 @@ def evaluate_unseen_300(
             valid_indices.append(idx)
 
     if len(valid_indices) == 0:
-        empty_df = pd.DataFrame()
+        empty_df = pd.DataFrame(columns=[
+            "curve_idx", "Voc", "V_true", "P_true", "V_coarse_best", "coarse_diff_pct",
+            "V_ann", "ann_diff_pct", "ann_beats_coarse", "ann_equals_or_beats_coarse",
+            "ann_power_regret_pct", "ann_std_vhat", "V_final_hybrid",
+            "final_hybrid_vdiff_pct", "final_hybrid_power_regret_pct", "final_ratio_pct",
+            "tracking_eff_pct", "fallback", "ambiguous_case", "uncertain_ann",
+            "dual_peak_rescue_used", "top3_rescue_used", "episode_time_s", "mode",
+            "n_eval_points", "hold_time_fraction", "total_probe_time_s",
+            "total_hold_time_s", "trust_ann", "trust_prob"
+        ])
         empty_summary = {
             "n_eval_valid": 0,
             "mean_ann_diff_pct": float("nan"),
@@ -1957,6 +2007,9 @@ def visualize_examples(examples, n_viz=8, seed=7):
     plt.show()
 
 def plot_final_error_distribution(df_results):
+    if df_results is None or len(df_results) == 0 or "final_hybrid_vdiff_pct" not in df_results.columns:
+        print("No final error distribution to plot.")
+        return
     plt.figure(figsize=(10, 5))
     plt.hist(df_results["final_hybrid_vdiff_pct"], bins=30, alpha=0.75)
     plt.xlabel("Final Hybrid Percent Difference from True Vmpp (%)")
@@ -2015,10 +2068,32 @@ exp_cal_curves, exp_hold_curves = split_experimental_curves(
     seed=cfg.seed,
 )
 
+print("\n=== SPLIT DEBUG ===")
+print("len(exp_cal_curves):", len(exp_cal_curves))
+print("len(exp_hold_curves):", len(exp_hold_curves))
+
+if len(exp_cal_curves) == 0:
+    raise RuntimeError("Experimental calibration split is empty after robust splitting.")
+
+if len(exp_hold_curves) == 0:
+    raise RuntimeError("Experimental holdout split is empty after robust splitting.")
+
 print("\nFitting trust gate on experimental calibration split...")
 trust_gate_cal_df = build_trust_gate_dataset(
     exp_cal_curves, models, mu, sd, residual_scale, cfg
 )
+print("trust_gate_cal_df.shape:", trust_gate_cal_df.shape)
+print("trust_gate_cal_df.columns:", trust_gate_cal_df.columns.tolist())
+
+required_gate_cols = list(cfg.trust_gate_use_features) + ["ann_beats_coarse", "ann_err_pct", "coarse_err_pct"]
+missing_gate_cols = [c for c in required_gate_cols if c not in trust_gate_cal_df.columns]
+
+if len(trust_gate_cal_df) == 0:
+    raise RuntimeError("Trust-gate calibration dataframe is empty after robust splitting.")
+
+if missing_gate_cols:
+    raise RuntimeError(f"Trust-gate calibration dataframe is missing required columns: {missing_gate_cols}")
+
 trust_gate_model, trust_gate_feature_names = fit_trust_gate(trust_gate_cal_df, cfg)
 trust_threshold, trust_threshold_score = choose_trust_threshold(
     trust_gate_cal_df,
@@ -2044,7 +2119,7 @@ ab_table, baseline_df, optimized_df = evaluate_static_ab(
     eval_curves, models, mu, sd, residual_scale, cfg
 )
 
-exp_list = np.asarray(exp_curves).ravel()
+exp_list = list(iter_curve_items(exp_curves))
 if len(exp_list) > 0:
     seq = []
     take = min(8, len(exp_list))
@@ -2073,7 +2148,10 @@ for k, v in dyn_summary.items():
 print("\n=== DYNAMIC A/B SUMMARY (global-only vs supervisory) ===")
 display(dyn_ab_table)
 
-display(df_results.head(10))
+if len(df_results) > 0:
+    display(df_results.head(10))
+else:
+    print("No holdout rows to display.")
 
 print("\n=== ANN VS COARSE REPORT ===")
 print(f"mean_ann_diff_pct: {summary['mean_ann_diff_pct']:.4f}")
