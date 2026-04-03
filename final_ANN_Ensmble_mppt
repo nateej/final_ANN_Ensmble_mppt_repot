@@ -774,6 +774,8 @@ class RuntimeState:
     last_v_best: float = 0.0
     last_p_best: float = 0.0
     last_mode: str = "global"
+    last_v_observed: Optional[float] = None
+    last_p_observed: Optional[float] = None
 
 def add_probe(E: float, t: float, P: float, dt: float) -> Tuple[float, float]:
     return E + P * dt, t + dt
@@ -904,6 +906,21 @@ def predict_ann_stage_for_oracle(oracle: CurveOracle, models, mu, sd, residual_s
         "pred_vhat_max": float(ens["max_vhat"]),
     }
 
+def get_runtime_tuning(cfg: Config) -> Dict[str, object]:
+    if cfg.use_lean_global_runtime:
+        return {
+            "max_refine_iterations": cfg.max_refine_iterations,
+            "dual_rescue_offsets": cfg.dual_rescue_offsets,
+            "widen_scan_steps": cfg.widen_scan_steps,
+            "enable_top3_rescue": cfg.enable_top3_rescue,
+        }
+    return {
+        "max_refine_iterations": max(cfg.max_refine_iterations, 10),
+        "dual_rescue_offsets": (-0.06, -0.03, 0.0, 0.03, 0.06),
+        "widen_scan_steps": max(cfg.widen_scan_steps, 10),
+        "enable_top3_rescue": True,
+    }
+
 def run_global_gmppt_episode_logged(
     oracle: CurveOracle,
     models,
@@ -913,6 +930,12 @@ def run_global_gmppt_episode_logged(
     cfg: Config,
 ):
     stats = StageStats()
+    runtime = get_runtime_tuning(cfg)
+    max_refine_iterations = int(runtime["max_refine_iterations"])
+    dual_rescue_offsets = tuple(runtime["dual_rescue_offsets"])
+    widen_scan_steps = int(runtime["widen_scan_steps"])
+    enable_top3_rescue = bool(runtime["enable_top3_rescue"])
+
     if oracle.voc <= 0 or oracle.pmpp_true <= 0:
         return {"eff": 0.0, "ratio": 0.0, "time": 0.0, "fallback": False}, {
             "Voc": 0.0,
@@ -1034,7 +1057,7 @@ def run_global_gmppt_episode_logged(
 
     # 3) local refine
     delta = cfg.delta_local
-    for _ in range(cfg.max_refine_iterations):
+    for _ in range(max_refine_iterations):
         p_round_start = P_best
         improved = False
         candidates = [
@@ -1077,7 +1100,7 @@ def run_global_gmppt_episode_logged(
         E, t, V_best, P_best = run_targeted_rescue(
             oracle=oracle,
             candidate_centers=candidate_centers,
-            offsets=cfg.dual_rescue_offsets,
+            offsets=dual_rescue_offsets,
             cfg=cfg,
             E=E,
             t=t,
@@ -1097,7 +1120,7 @@ def run_global_gmppt_episode_logged(
         or (P_best < cfg.top3_trigger_power_ratio * coarse_best)
     )
 
-    if cfg.enable_top3_rescue and suspicious_case:
+    if enable_top3_rescue and suspicious_case:
         log["top3_rescue_used"] = True
         order_desc = np.argsort(P_coarse)[::-1]
         top_k = min(3, len(order_desc))
@@ -1130,7 +1153,7 @@ def run_global_gmppt_episode_logged(
             E, t, V_best, P_best = run_targeted_rescue(
                 oracle=oracle,
                 candidate_centers=fallback_centers,
-                offsets=cfg.dual_rescue_offsets,
+                offsets=dual_rescue_offsets,
                 cfg=cfg,
                 E=E,
                 t=t,
@@ -1142,7 +1165,7 @@ def run_global_gmppt_episode_logged(
             )
 
         if P_best < cfg.fallback_power_ratio_thresh * coarse_best:
-            for frac in np.linspace(0.15, 0.90, cfg.widen_scan_steps):
+            for frac in np.linspace(0.15, 0.90, widen_scan_steps):
                 vq = float(frac * Voc)
                 pq = vq * oracle.measure(vq)
                 E, t = add_probe(E, t, pq, cfg.dt_meas)
@@ -1179,10 +1202,9 @@ def run_global_gmppt_episode_logged(
     }
     return result, log
 
-def shading_change_detected(p_now, p_prev, v_now, v_prev, cfg):
+def shading_change_detected(p_now, p_prev, cfg):
     dP = abs(p_now - p_prev) / max(abs(p_prev), 1e-9)
-    dV = abs(v_now - v_prev) / max(abs(v_prev), 1e-9)
-    return (dP >= cfg.event_trigger_power_delta_ratio or dV >= cfg.event_trigger_voltage_delta_ratio)
+    return dP >= cfg.event_trigger_power_delta_ratio
 
 def run_local_track_episode_logged(oracle: CurveOracle, state: RuntimeState, cfg: Config):
     stats = StageStats()
@@ -1251,12 +1273,13 @@ def run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scal
     if not state.initialized:
         result, log = run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
     else:
-        v_prev = state.last_v_best
-        i_prev = oracle.measure(v_prev)
-        p_now = v_prev * i_prev
-        if cfg.use_event_triggered_global and not shading_change_detected(
-            p_now, state.last_p_best, v_prev, state.last_v_best, cfg
-        ):
+        v_observed = state.last_v_best
+        p_observed = float(v_observed * oracle.measure(v_observed))
+        prev_p = state.last_p_observed if state.last_p_observed is not None else state.last_p_best
+        should_run_local = cfg.use_event_triggered_global and not shading_change_detected(
+            p_observed, prev_p, cfg
+        )
+        if should_run_local:
             result, log = run_local_track_episode_logged(oracle, state, cfg)
         else:
             result, log = run_global_gmppt_episode_logged(oracle, models, mu, sd, residual_scale, cfg)
@@ -1265,6 +1288,12 @@ def run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scal
     state.last_v_best = log["V_best"]
     state.last_p_best = log["P_best"]
     state.last_mode = log["mode"]
+    state.last_v_observed = state.last_v_best
+    state.last_p_observed = state.last_p_best
+    return result, log, state
+
+def run_hybrid_supervised_step(oracle, state, models, mu, sd, residual_scale, cfg):
+    result, log, state = run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scale, cfg)
     return result, log, state
 
 def run_hybrid_episode_logged(oracle: CurveOracle, models, mu: np.ndarray, sd: np.ndarray, residual_scale: float, cfg: Config):
@@ -1420,7 +1449,7 @@ def evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale
         oracle = CurveOracle(curve)
         if oracle.voc <= 0 or oracle.pmpp_true <= 0:
             continue
-        result, log, state = run_supervisory_controller_step(oracle, state, models, mu, sd, residual_scale, cfg)
+        result, log, state = run_hybrid_supervised_step(oracle, state, models, mu, sd, residual_scale, cfg)
         rows.append({
             "step": step_idx,
             "mode": log["mode"],
@@ -1442,6 +1471,19 @@ def evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale
         "recovery_quality_after_transitions": float(df["final_ratio"].mean()),
     }
     return summary, df
+
+def evaluate_transition_ab(curve_sequence, models, mu, sd, residual_scale, cfg: Config):
+    baseline_cfg = Config(**cfg.__dict__)
+    baseline_cfg.use_event_triggered_global = False
+
+    baseline_summary, baseline_df = evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, baseline_cfg)
+    supervised_summary, supervised_df = evaluate_transition_sequences(curve_sequence, models, mu, sd, residual_scale, cfg)
+
+    comp = pd.DataFrame([
+        {"controller": "global_every_step_baseline", **baseline_summary},
+        {"controller": "supervisory_local_global", **supervised_summary},
+    ])
+    return comp, baseline_df, supervised_df
 
 # -------------------------
 # PLOTS
@@ -1539,8 +1581,10 @@ print("\nBest validation loss per model:")
 for i, loss in enumerate(best_losses, 1):
     print(f"  model {i}: {loss:.6f}")
 
-print("\nEvaluating on unseen test/experimental curves (optimized controller)...")
-summary, df_results, examples = evaluate_unseen_300(exp_curves, models, mu, sd, residual_scale, cfg)
+print("\nEvaluating on unseen test/experimental curves (static single-curve benchmark)...")
+summary, df_results, examples = evaluate_unseen_300(
+    exp_curves, models, mu, sd, residual_scale, cfg, controller_fn=run_global_gmppt_episode_logged
+)
 ab_table, baseline_df, optimized_df = evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg)
 
 exp_list = np.asarray(exp_curves).ravel()
@@ -1550,17 +1594,21 @@ if len(exp_list) > 0:
     for k in range(take):
         seq.extend([exp_list[k], exp_list[k], exp_list[k]])
     dyn_summary, dyn_df = evaluate_transition_sequences(seq, models, mu, sd, residual_scale, cfg)
+    dyn_ab_table, dyn_base_df, dyn_supervised_df = evaluate_transition_ab(seq, models, mu, sd, residual_scale, cfg)
 else:
     dyn_summary, dyn_df = {"n_steps": 0}, pd.DataFrame()
+    dyn_ab_table, dyn_base_df, dyn_supervised_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 print("\n=== UNSEEN TEST SUMMARY ===")
 for k, v in summary.items():
     print(f"{k}: {v}")
 print("\n=== STATIC A/B SUMMARY (baseline vs optimized) ===")
 display(ab_table)
-print("\n=== DYNAMIC SEQUENCE SUMMARY ===")
+print("\n=== DYNAMIC SEQUENCE SUMMARY (OFFICIAL DEPLOYMENT PATH) ===")
 for k, v in dyn_summary.items():
     print(f"{k}: {v}")
+print("\n=== DYNAMIC A/B SUMMARY (global-only vs supervisory) ===")
+display(dyn_ab_table)
 
 display(df_results.head(10))
 
@@ -1580,6 +1628,7 @@ if SAVE_MODEL_BUNDLE:
         "summary": summary,
         "static_ab_table": ab_table.to_dict(orient="records"),
         "dynamic_summary": dyn_summary,
+        "dynamic_ab_table": dyn_ab_table.to_dict(orient="records"),
     }
     save_path = "milestone_ann_mppt_top3_rescue_bundle.pt"
     torch.save(bundle, save_path)
