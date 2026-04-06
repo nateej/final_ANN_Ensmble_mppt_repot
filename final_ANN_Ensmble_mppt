@@ -25,6 +25,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from IPython.display import display
 
+# Colab install helper (run in notebook cell before imports if needed):
+# !pip install -q "mamba-ssm[causal-conv1d]"
+# If that fails:
+# !pip install -q causal-conv1d>=1.4.0
+# !pip install -q mamba-ssm --no-build-isolation
+
 try:
     from scipy.io import loadmat
 except Exception:
@@ -447,6 +453,14 @@ class CurveOracle:
 
     def curve_for_plot(self) -> Tuple[np.ndarray, np.ndarray]:
         return self._v.copy(), np.maximum(self._i.copy(), 0.0)
+
+    @property
+    def v(self) -> np.ndarray:
+        return self._v
+
+    @property
+    def i(self) -> np.ndarray:
+        return self._i
 
 def build_feature_vector(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarray) -> Dict[str, np.ndarray]:
     voc = float(np.max(v))
@@ -2483,6 +2497,7 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
     X_seq, y_vhat, y_power, y_coarse = [], [], [], []
     meta = {"coarse_ratio_pct": [], "coarse_diff_pct": [], "multi_peak_count": [], "ambiguity_flag": []}
     rng = np.random.default_rng(cfg.seed + (13 if augment else 0))
+    aux = {"voc": [], "isc": [], "rs": [], "rsh": [], "temperature": []}
 
     for item in list(iter_curve_items(curves)):
         v_raw, i_raw = extract_vi(item)
@@ -2497,7 +2512,7 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
             if len(v) < 5 or not validate_cleaned_curve(v, i):
                 continue
 
-        oracle = CurveOracle({"V": v, "I": i})
+        oracle = CurveOracle(np.stack([v, i], axis=0))
         feat = build_feature_vector(v, i, sample_fracs)
         voc = max(float(oracle.voc), 1e-6)
         isc = max(float(oracle.isc), 1e-6)
@@ -2524,6 +2539,11 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
         meta["coarse_diff_pct"].append(np.float32(100.0 * abs((coarse_v - oracle.vmpp_true) / max(oracle.vmpp_true, 1e-9))))
         meta["multi_peak_count"].append(np.float32(feat["multi_peak_count"]))
         meta["ambiguity_flag"].append(np.float32(feat["ambiguity_flag"]))
+        aux["voc"].append(np.float32(oracle.voc))
+        aux["isc"].append(np.float32(oracle.isc))
+        aux["rs"].append(np.float32(np.nan))
+        aux["rsh"].append(np.float32(np.nan))
+        aux["temperature"].append(np.float32(np.nan))
 
     return {
         "X_seq": np.asarray(X_seq, dtype=np.float32),
@@ -2531,6 +2551,7 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
         "y_power_true": np.asarray(y_power, dtype=np.float32),
         "y_coarse_vhat": np.asarray(y_coarse, dtype=np.float32),
         **{k: np.asarray(v, dtype=np.float32) for k, v in meta.items()},
+        **{f"aux_{k}": np.asarray(v, dtype=np.float32) for k, v in aux.items()},
     }
 
 # -------------------------
@@ -2601,10 +2622,23 @@ def pinn_loss(pred_vhat, true_vhat, true_power_ratio, coarse_vhat, seq_x, cfg: C
     total = cfg.w_data * (l_voltage + l_power) + cfg.w_phys * l_phys + cfg.w_mpp * l_mpp + cfg.w_bound * l_bound
     return total
 
+def single_diode_residual(pred_vhat, seq_x, cfg: Config, aux_params: Dict[str, torch.Tensor]):
+    if aux_params is None:
+        raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
+    required = ("voc", "isc")
+    for k in required:
+        if k not in aux_params:
+            raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
+        if torch.isnan(aux_params[k]).any():
+            raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
+    raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
+
 # -------------------------
 # train_eval.py
 # -------------------------
 def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarray], cfg: Config):
+    if cfg.model_mode == "mamba_pinn":
+        raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
     if cfg.model_mode == "mlp_baseline":
         flat_dataset = build_dataset_from_curves(train_data["curves"], cfg.sample_fracs, cfg)
         return {"kind": "mlp", "bundle": train_ensemble(flat_dataset, cfg)}
@@ -2665,7 +2699,8 @@ def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarra
 
 def _predict_ann_vhat_for_curve(curve_item, trained, cfg: Config):
     oracle = CurveOracle(curve_item)
-    feat = build_feature_vector(oracle.v, oracle.i, cfg.sample_fracs)
+    v_plot, i_plot = oracle.curve_for_plot()
+    feat = build_feature_vector(v_plot, i_plot, cfg.sample_fracs)
     if trained["kind"] == "mlp":
         models, mu, sd, _, _, residual_scale = trained["bundle"]
         x_std = (feat["x"] - mu) / sd
@@ -2686,7 +2721,8 @@ def evaluate_ann_only(test_curves, trained, cfg: Config):
         oracle = CurveOracle(item)
         if oracle.voc <= 0 or oracle.pmpp_true <= 0:
             continue
-        feat = build_feature_vector(oracle.v, oracle.i, cfg.sample_fracs)
+        v_plot, i_plot = oracle.curve_for_plot()
+        feat = build_feature_vector(v_plot, i_plot, cfg.sample_fracs)
         coarse_vhat = float(feat["coarse_best_vhat"])
         ann_vhat = _predict_ann_vhat_for_curve(item, trained, cfg)
         V_true, P_true = float(oracle.vmpp_true), float(oracle.pmpp_true)
@@ -2727,6 +2763,23 @@ def evaluate_ann_only(test_curves, trained, cfg: Config):
 def evaluate_supervised_ann(test_curves, trained, cfg: Config):
     return evaluate_ann_only(test_curves, trained, cfg)
 
+def run_ablations(sim_test_curves, exp_curves, trained_models_by_mode, cfg: Config):
+    rows = []
+    for mode_name, trained in trained_models_by_mode.items():
+        sim_summary, _ = evaluate_ann_only(sim_test_curves, trained, cfg)
+        exp_summary, _ = evaluate_ann_only(exp_curves, trained, cfg)
+        if len(sim_summary) == 0 or len(exp_summary) == 0:
+            continue
+        for split_name, summary in (("sim_holdout_test", sim_summary), ("exp_unseen_test", exp_summary)):
+            row = {"mode": mode_name, "split": split_name}
+            row.update(summary)
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    if len(df) > 0:
+        df.to_csv("ann_only_ablation_table.csv", index=False)
+        torch.save(df.to_dict(orient="records"), "ann_only_ablation_table.pt")
+    return df
+
 def evaluate_power_metrics(summary: Dict[str, float]):
     return {
         "pass_mean_ratio": summary.get("mean_ann_ratio_pct", -1) > summary.get("mean_coarse_ratio_pct", 1e9),
@@ -2747,6 +2800,20 @@ if CONTROL_MODE not in ALLOWED_CONTROL_MODES:
 
 if CONTROL_MODE == "supervised_voltage":
     train_curves, val_curves, test_curves = split_curves_train_val_test(sim_curves, seed=cfg.seed)
+    print("\n=== STARTUP MANIFEST ===")
+    print({
+        "MODEL_MODE": MODEL_MODE,
+        "CONTROL_MODE": CONTROL_MODE,
+        "device": cfg.device,
+        "d_model": cfg.d_model,
+        "n_blocks": cfg.n_blocks,
+        "warmup_epochs": cfg.warmup_epochs,
+        "grad_clip_norm": cfg.grad_clip_norm,
+        "train_size": len(train_curves),
+        "val_size": len(val_curves),
+        "test_size": len(test_curves),
+        "exp_unseen_size": len(list(iter_curve_items(exp_curves))),
+    })
     if MODEL_MODE == "mlp_baseline":
         train_payload = {"curves": train_curves}
         val_payload = {"curves": val_curves}
@@ -2760,28 +2827,45 @@ if CONTROL_MODE == "supervised_voltage":
     run_cfg.control_mode = CONTROL_MODE
     trained = train_model(train_payload, val_payload, run_cfg)
 
-    eval_summary, eval_df = evaluate_supervised_ann(exp_curves, trained, run_cfg)
-    power_eval = evaluate_power_metrics(eval_summary) if len(eval_summary) > 0 else {}
+    sim_summary, sim_df = evaluate_supervised_ann(test_curves, trained, run_cfg)
+    exp_summary, exp_df = evaluate_supervised_ann(exp_curves, trained, run_cfg)
+    power_eval = evaluate_power_metrics(exp_summary) if len(exp_summary) > 0 else {}
 
-    print("\n=== ANN-ONLY EVALUATION (NO HYBRID FALLBACK) ===")
-    for k, v in eval_summary.items():
+    print("\n=== SIM HOLDOUT ANN-ONLY SUMMARY ===")
+    for k, v in sim_summary.items():
+        print(f"{k}: {v}")
+    print("\n=== EXP UNSEEN ANN-ONLY SUMMARY ===")
+    for k, v in exp_summary.items():
         print(f"{k}: {v}")
     print("pass_criteria:", power_eval)
+    print("PASS" if all(power_eval.values()) else "FAIL")
 
-    if SAVE_RUN_ARTIFACTS and len(eval_summary) > 0:
+    ablation_df = run_ablations(test_curves, exp_curves, {MODEL_MODE: trained}, run_cfg)
+    if len(ablation_df) > 0:
+        print("\nSaved: ann_only_ablation_table.csv")
+
+    if SAVE_RUN_ARTIFACTS and len(exp_summary) > 0:
+        model_state = None
+        if "model" in trained:
+            model_state = {k: v.detach().cpu() for k, v in trained["model"].state_dict().items()}
         artifact = {
             "model_mode": MODEL_MODE,
             "control_mode": CONTROL_MODE,
             "config": run_cfg.__dict__,
-            "summary": eval_summary,
+            "model_state_dict": model_state,
+            "sim_holdout_summary": sim_summary,
+            "exp_unseen_summary": exp_summary,
+            "ablation_table_rows": ablation_df.to_dict(orient="records") if len(ablation_df) > 0 else [],
             "pass_criteria": power_eval,
-            "rows_head": eval_df.head(100).to_dict(orient="records"),
+            "sim_rows_head": sim_df.head(100).to_dict(orient="records"),
+            "exp_rows_head": exp_df.head(100).to_dict(orient="records"),
         }
         torch.save(artifact, f"ann_only_{MODEL_MODE}_artifacts.pt")
         print(f"Saved: ann_only_{MODEL_MODE}_artifacts.pt")
 
     raise SystemExit(0)
 
+# LEGACY HYBRID SECTION (NOT USED FOR ANN-ONLY CLAIMS)
 print("\nBuilding cleaned training dataset from simulated curves...")
 dataset = build_dataset_from_curves(sim_curves, cfg.sample_fracs, cfg)
 X = dataset["X"]
