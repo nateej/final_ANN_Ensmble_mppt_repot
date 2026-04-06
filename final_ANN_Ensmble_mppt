@@ -1742,6 +1742,9 @@ def evaluate_unseen_300(
         empty_df = pd.DataFrame(columns=[
             "curve_idx", "Voc", "V_true", "P_true", "V_coarse_best", "coarse_diff_pct",
             "V_ann", "ann_diff_pct", "ann_beats_coarse", "ann_equals_or_beats_coarse",
+            "P_coarse_best", "coarse_power_regret_pct", "coarse_ratio_pct",
+            "P_ann", "ann_ratio_pct", "ann_better_than_coarse_power", "ann_worse_than_coarse_power",
+            "ann_equal_or_neutral_power",
             "V_gated_choice", "gated_choice_diff_pct", "gated_choice_power_regret_pct",
             "gated_beats_coarse", "gated_equals_or_beats_coarse",
             "gated_beats_raw_ann", "gated_equals_or_beats_raw_ann", "gated_choice_source",
@@ -1754,6 +1757,18 @@ def evaluate_unseen_300(
         ])
         empty_summary = {
             "n_eval_valid": 0,
+            "mean_coarse_power_regret_pct": float("nan"),
+            "median_coarse_power_regret_pct": float("nan"),
+            "max_coarse_power_regret_pct": float("nan"),
+            "mean_ann_power_regret_pct": float("nan"),
+            "median_ann_power_regret_pct": float("nan"),
+            "max_ann_power_regret_pct": float("nan"),
+            "mean_coarse_ratio_pct": float("nan"),
+            "mean_ann_ratio_pct": float("nan"),
+            "ann_power_gain_vs_coarse_pct_points": float("nan"),
+            "ann_better_than_coarse_power_rate": float("nan"),
+            "ann_worse_than_coarse_power_rate": float("nan"),
+            "ann_equal_or_neutral_power_rate": float("nan"),
             "mean_ann_diff_pct": float("nan"),
             "median_ann_diff_pct": float("nan"),
             "max_ann_diff_pct": float("nan"),
@@ -1812,6 +1827,13 @@ def evaluate_unseen_300(
         P_ann = pred_info["P_raw_ann"]
         V_coarse_best = pred_info["V_coarse"]
         P_coarse_best = pred_info["P_coarse"]
+        coarse_power_regret_pct = 100.0 * max(oracle.pmpp_true - P_coarse_best, 0.0) / (abs(oracle.pmpp_true) + 1e-9)
+        coarse_ratio_pct = 100.0 * P_coarse_best / (abs(oracle.pmpp_true) + 1e-9)
+        ann_ratio_pct = 100.0 * P_ann / (abs(oracle.pmpp_true) + 1e-9)
+        eps = 1e-9
+        ann_better_than_coarse_power = int(P_ann > P_coarse_best + eps)
+        ann_worse_than_coarse_power = int(P_ann + eps < P_coarse_best)
+        ann_equal_or_neutral_power = int(abs(P_ann - P_coarse_best) <= eps)
         V_gated = pred_info["V_gated"]
         P_gated = pred_info["P_gated"]
 
@@ -1854,6 +1876,14 @@ def evaluate_unseen_300(
             "ann_diff_pct": ann_diff_pct,
             "ann_beats_coarse": ann_beats_coarse,
             "ann_equals_or_beats_coarse": ann_equals_or_beats_coarse,
+            "P_coarse_best": P_coarse_best,
+            "coarse_power_regret_pct": coarse_power_regret_pct,
+            "coarse_ratio_pct": coarse_ratio_pct,
+            "P_ann": P_ann,
+            "ann_ratio_pct": ann_ratio_pct,
+            "ann_better_than_coarse_power": ann_better_than_coarse_power,
+            "ann_worse_than_coarse_power": ann_worse_than_coarse_power,
+            "ann_equal_or_neutral_power": ann_equal_or_neutral_power,
             "V_gated_choice": V_gated,
             "gated_choice_diff_pct": gated_diff_pct,
             "gated_choice_power_regret_pct": gated_power_regret_pct,
@@ -1895,6 +1925,9 @@ def evaluate_unseen_300(
             "P_coarse_best": P_coarse_best,
             "V_final": float(hybrid_log["V_best"]),
             "P_final": float(hybrid_log["P_best"]),
+            "coarse_ratio_pct": coarse_ratio_pct,
+            "ann_ratio_pct": ann_ratio_pct,
+            "final_ratio_pct": 100.0 * float(hybrid_res["ratio"]),
             "fallback": bool(hybrid_res["fallback"]),
             "ambiguous_case": bool(hybrid_res["ambiguous_case"]),
             "uncertain_ann": bool(hybrid_res["uncertain_ann"]),
@@ -1912,6 +1945,18 @@ def evaluate_unseen_300(
             trust_ann_rate_pct = float(100.0 * trust_series.mean())
     summary = {
         "n_eval_valid": int(len(df)),
+        "mean_coarse_power_regret_pct": float(df["coarse_power_regret_pct"].mean()),
+        "median_coarse_power_regret_pct": float(df["coarse_power_regret_pct"].median()),
+        "max_coarse_power_regret_pct": float(df["coarse_power_regret_pct"].max()),
+        "mean_ann_power_regret_pct": float(df["ann_power_regret_pct"].mean()),
+        "median_ann_power_regret_pct": float(df["ann_power_regret_pct"].median()),
+        "max_ann_power_regret_pct": float(df["ann_power_regret_pct"].max()),
+        "mean_coarse_ratio_pct": float(df["coarse_ratio_pct"].mean()),
+        "mean_ann_ratio_pct": float(df["ann_ratio_pct"].mean()),
+        "ann_power_gain_vs_coarse_pct_points": float(df["ann_ratio_pct"].mean() - df["coarse_ratio_pct"].mean()),
+        "ann_better_than_coarse_power_rate": float(100.0 * df["ann_better_than_coarse_power"].mean()),
+        "ann_worse_than_coarse_power_rate": float(100.0 * df["ann_worse_than_coarse_power"].mean()),
+        "ann_equal_or_neutral_power_rate": float(100.0 * df["ann_equal_or_neutral_power"].mean()),
         "mean_ann_diff_pct": float(df["ann_diff_pct"].mean()),
         "median_ann_diff_pct": float(df["ann_diff_pct"].median()),
         "max_ann_diff_pct": float(df["ann_diff_pct"].max()),
@@ -2166,8 +2211,8 @@ def visualize_examples(examples, n_viz=8, seed=7):
         ax.scatter([item["V_final"]], [item["P_final"]], marker="D", s=70, label="Final hybrid best", zorder=6)
 
         ax.set_title(
-            f"Curve {item['idx']} | ANN diff={item['ann_diff_pct']:.2f}% | "
-            f"Final diff={item['final_vdiff_pct']:.2f}% | "
+            f"Curve {item['idx']} | Coarse ratio={item['coarse_ratio_pct']:.2f}% | "
+            f"ANN ratio={item['ann_ratio_pct']:.2f}% | Final ratio={item['final_ratio_pct']:.2f}% | "
             f"Dual={item['dual_peak_rescue_used']} | Top3={item['top3_rescue_used']} | "
             f"Fallback={item['fallback']}"
         )
@@ -2288,6 +2333,14 @@ summary, df_results, examples = evaluate_unseen_300(
     gate_feature_names=trust_gate_feature_names,
     trust_threshold=trust_threshold,
 )
+print("\n=== POWER-FIRST SANITY CHECK ===")
+print(f"Mean coarse ratio (%): {summary['mean_coarse_ratio_pct']:.4f}")
+print(f"Mean ANN ratio (%): {summary['mean_ann_ratio_pct']:.4f}")
+print(f"ANN gain vs coarse (pct-points): {summary['ann_power_gain_vs_coarse_pct_points']:.4f}")
+print(f"ANN better-than-coarse rate (%): {summary['ann_better_than_coarse_power_rate']:.2f}")
+print(f"ANN worse-than-coarse rate (%): {summary['ann_worse_than_coarse_power_rate']:.2f}")
+print(f"Mean final ratio (%): {summary['mean_final_ratio_pct']:.4f}")
+print(f"Mean tracking efficiency (%): {summary['mean_tracking_eff_pct']:.4f}")
 predictor_comp = build_predictor_comparison_table(summary)
 gated_threshold_table = None
 if trust_gate_model is not None and trust_gate_feature_names is not None:
@@ -2323,6 +2376,13 @@ else:
 print("\n=== UNSEEN TEST SUMMARY ===")
 for k, v in summary.items():
     print(f"{k}: {v}")
+print("\n=== POWER-FIRST INTERPRETATION BLOCK ===")
+print(f"ANN stage mean power ratio (%): {summary['mean_ann_ratio_pct']:.4f}")
+print(f"Coarse stage mean power ratio (%): {summary['mean_coarse_ratio_pct']:.4f}")
+print(f"ANN gain/loss over coarse (pct-points): {summary['ann_power_gain_vs_coarse_pct_points']:.4f}")
+print(f"Final hybrid mean power ratio (%): {summary['mean_final_ratio_pct']:.4f}")
+print(f"Final hybrid mean tracking efficiency (%): {summary['mean_tracking_eff_pct']:.4f}")
+print(f"ANN beats coarse on power rate (%): {summary['ann_better_than_coarse_power_rate']:.2f}")
 print("\n=== STATIC A/B SUMMARY (baseline vs optimized) ===")
 display(ab_table)
 print("\n=== DYNAMIC SEQUENCE SUMMARY (OFFICIAL DEPLOYMENT PATH) ===")
@@ -2407,16 +2467,16 @@ if SAVE_MODEL_BUNDLE:
 
 print("\nPresentation-ready result:")
 print(
-    f"We kept the same 12 ANN sample points and retained residual ANN prediction, local refinement, "
-    f"deterministic rescue, and fallback scanning while adding adaptive hold and supervisory local/global runtime. "
-    f"On {summary['n_eval_valid']} unseen test curves, the ANN stage achieved an "
-    f"average MPPT-voltage difference of {summary['mean_ann_diff_pct']:.3f}% relative to the true GMPP voltage, "
-    f"and the final hybrid controller achieved an average final voltage difference of "
-    f"{summary['mean_final_hybrid_vdiff_pct']:.3f}%, average final power ratio of "
-    f"{summary['mean_final_ratio_pct']:.2f}%, and average tracking efficiency of "
-    f"{summary['mean_tracking_eff_pct']:.2f}%. The dual-peak rescue activated on "
-    f"{summary['dual_peak_rescue_rate_pct']:.2f}% of cases and top-3 rescue activated on "
-    f"{summary['top3_rescue_rate_pct']:.2f}% of unseen cases."
+    f"We kept the same 12 ANN sample points and retained adaptive local refinement and fallback. "
+    f"On {summary['n_eval_valid']} unseen test curves, the coarse 12-point stage achieved mean power ratio "
+    f"{summary['mean_coarse_ratio_pct']:.2f}%. The ANN-guided stage achieved mean power ratio "
+    f"{summary['mean_ann_ratio_pct']:.2f}%, corresponding to mean power regret "
+    f"{summary['mean_ann_power_regret_pct']:.3f}%. The ANN outperformed the coarse stage on power in "
+    f"{summary['ann_better_than_coarse_power_rate']:.2f}% of unseen cases and underperformed it in "
+    f"{summary['ann_worse_than_coarse_power_rate']:.2f}%. After local refinement and fallback, the full hybrid "
+    f"controller achieved final power ratio {summary['mean_final_ratio_pct']:.2f}% and tracking efficiency "
+    f"{summary['mean_tracking_eff_pct']:.2f}%. As a secondary voltage diagnostic, the final hybrid mean voltage "
+    f"difference remained {summary['mean_final_hybrid_vdiff_pct']:.3f}%."
 )
 
 print("\n=== FINAL INTERPRETATION ===")
