@@ -94,6 +94,8 @@ except Exception:
 DATASET_PATH = None
 MAKE_PLOTS = True
 SAVE_MODEL_BUNDLE = True
+MAT_SIM_KEYS = None
+MAT_EXP_KEYS = None
 
 MODEL_MODE = "mamba_supervised"   # allowed: "mlp_baseline", "mamba_supervised", "mamba_pinn"
 CONTROL_MODE = "supervised_voltage"   # allowed: "supervised_voltage", "rl_control"
@@ -271,18 +273,112 @@ def load_curves_from_npz(path: str):
         raise ValueError(
             f"NPZ must contain sim_curves and exp_curves (or test_curves). Found keys={keys}"
         )
-    return sim_curves, exp_curves
+    exp_source_key = "exp_curves" if "exp_curves" in keys else "test_curves"
+    sim_list = list(iter_curve_items(sim_curves))
+    exp_list = list(iter_curve_items(exp_curves))
+    return sim_list, exp_list, ["sim_curves"], [exp_source_key]
+
+def inspect_mat_keys(path):
+    if loadmat is None:
+        raise RuntimeError("scipy is required to read .mat files")
+    mat = loadmat(path)
+    key_meta = {}
+    visible_keys = [k for k in mat.keys() if not k.startswith("__")]
+    print("\nMAT key inspection:")
+    for key in visible_keys:
+        value = mat[key]
+        value_type = type(value).__name__
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        key_meta[key] = {
+            "type": value_type,
+            "shape": shape,
+            "dtype": dtype,
+        }
+        print(f"  - key={key}, type={value_type}, shape={shape}, dtype={dtype}")
+    return key_meta
+
+def _normalize_key_override(keys, label: str):
+    if keys is None:
+        return None
+    if isinstance(keys, str):
+        normalized = [keys]
+    elif isinstance(keys, (list, tuple)):
+        normalized = [str(k) for k in keys]
+    else:
+        raise TypeError(f"{label} must be None, a string, or a list/tuple of strings")
+    if len(normalized) == 0:
+        raise ValueError(f"{label} override was provided but empty")
+    return normalized
+
+def choose_mat_curve_arrays(mat_dict):
+    preferred_sim_keys = [
+        "full_curvesOk_simulated",
+        "full_curvesSh_simulated",
+        "sim_curves",
+        "simulated_curves",
+        "curves_sim",
+    ]
+    preferred_exp_keys = [
+        "full_curvesOk_experimental",
+        "full_curvesSh_experimental",
+        "exp_curves",
+        "experimental_curves",
+        "curves_exp",
+        "test_curves",
+    ]
+
+    visible_keys = [k for k in mat_dict.keys() if not k.startswith("__")]
+    key_lookup = {k.lower(): k for k in visible_keys}
+
+    sim_override = _normalize_key_override(MAT_SIM_KEYS, "MAT_SIM_KEYS")
+    exp_override = _normalize_key_override(MAT_EXP_KEYS, "MAT_EXP_KEYS")
+    if (sim_override is None) ^ (exp_override is None):
+        raise ValueError("Set both MAT_SIM_KEYS and MAT_EXP_KEYS together, or leave both as None")
+
+    if sim_override is not None and exp_override is not None:
+        sim_keys = []
+        exp_keys = []
+        for key in sim_override:
+            match = key_lookup.get(key.lower())
+            if match is None:
+                raise KeyError(f"MAT_SIM_KEYS contains '{key}', but that key was not found in MAT file")
+            sim_keys.append(match)
+        for key in exp_override:
+            match = key_lookup.get(key.lower())
+            if match is None:
+                raise KeyError(f"MAT_EXP_KEYS contains '{key}', but that key was not found in MAT file")
+            exp_keys.append(match)
+        return [mat_dict[k] for k in sim_keys], [mat_dict[k] for k in exp_keys], sim_keys, exp_keys
+
+    sim_keys = [key_lookup[k.lower()] for k in preferred_sim_keys if k.lower() in key_lookup]
+    exp_keys = [key_lookup[k.lower()] for k in preferred_exp_keys if k.lower() in key_lookup]
+    if len(sim_keys) == 0 or len(exp_keys) == 0:
+        raise ValueError(
+            "Failed to explicitly map simulated/experimental MAT arrays by name. "
+            f"Found keys={visible_keys}, matched_sim_keys={sim_keys}, matched_exp_keys={exp_keys}"
+        )
+    return [mat_dict[k] for k in sim_keys], [mat_dict[k] for k in exp_keys], sim_keys, exp_keys
+
+def flatten_curve_container(curves):
+    flat = []
+    for item in iter_curve_items(curves):
+        flat.append(item)
+    return flat
 
 def load_curves_from_mat(path: str):
     if loadmat is None:
         raise RuntimeError("scipy is required to read .mat files")
-    m = loadmat(path)
-    keys = [k for k in m.keys() if not k.startswith("__")]
-    obj_arrays = [(k, m[k]) for k in keys if isinstance(m[k], np.ndarray) and m[k].dtype == object]
-    obj_arrays.sort(key=lambda kv: np.prod(kv[1].shape), reverse=True)
-    if len(obj_arrays) < 2:
-        raise ValueError("Could not infer sim_curves and exp_curves from MAT file")
-    return obj_arrays[0][1], obj_arrays[1][1]
+    _ = inspect_mat_keys(path)
+    mat_dict = loadmat(path)
+    sim_arrays, exp_arrays, sim_keys, exp_keys = choose_mat_curve_arrays(mat_dict)
+    sim_curves = []
+    exp_curves = []
+    for arr in sim_arrays:
+        sim_curves.extend(flatten_curve_container(arr))
+    for arr in exp_arrays:
+        exp_curves.extend(flatten_curve_container(arr))
+    return sim_curves, exp_curves, sim_keys, exp_keys
 
 def load_dataset(path: str):
     path_lower = path.lower()
@@ -347,6 +443,35 @@ def extract_vi(curve) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     if c.shape[1] == 2:
         return np.asarray(c[:, 0], dtype=float).ravel(), np.asarray(c[:, 1], dtype=float).ravel()
     return None, None
+
+def summarize_curve_collection(name, curves, max_preview=3):
+    curve_list = flatten_curve_container(curves)
+    print(f"\n{name} summary:")
+    print(f"  - number_of_curves={len(curve_list)}")
+    preview_n = min(max_preview, len(curve_list))
+    for idx in range(preview_n):
+        v, i = extract_vi(curve_list[idx])
+        if v is None or i is None:
+            print(f"  - curve[{idx}]: could not extract V/I")
+            continue
+        v = np.asarray(v, dtype=float).ravel()
+        i = np.asarray(i, dtype=float).ravel()
+        valid = np.isfinite(v) & np.isfinite(i)
+        v = v[valid]
+        i = i[valid]
+        if len(v) == 0 or len(i) == 0:
+            print(f"  - curve[{idx}]: empty/invalid after filtering")
+            continue
+        p = v * i
+        best_idx = int(np.argmax(p))
+        voc = float(np.max(v))
+        isc = float(np.max(i))
+        vmpp = float(v[best_idx])
+        pmpp = float(p[best_idx])
+        print(
+            f"  - curve[{idx}]: len(V)={len(v)}, len(I)={len(i)}, "
+            f"Voc~{voc:.4f}, Isc~{isc:.4f}, Vmpp~{vmpp:.4f}, Pmpp~{pmpp:.4f}"
+        )
 
 # -------------------------
 # CLEANING / VALIDATION
@@ -3051,7 +3176,31 @@ def evaluate_power_metrics(summary: Dict[str, float]):
 # -------------------------
 # RUN PIPELINE
 # -------------------------
-sim_curves, exp_curves = load_dataset(DATASET_PATH)
+sim_curves, exp_curves, selected_sim_keys, selected_exp_keys = load_dataset(DATASET_PATH)
+sim_curves = flatten_curve_container(sim_curves)
+exp_curves = flatten_curve_container(exp_curves)
+
+print("\nSelected dataset sources:")
+print(f"  - selected simulated source keys: {selected_sim_keys}")
+print(f"  - selected experimental source keys: {selected_exp_keys}")
+print(f"  - number of simulated curves: {len(sim_curves)}")
+print(f"  - number of experimental curves: {len(exp_curves)}")
+summarize_curve_collection("Simulated curves", sim_curves, max_preview=3)
+summarize_curve_collection("Experimental curves", exp_curves, max_preview=3)
+
+if len(sim_curves) < 100:
+    raise ValueError(f"Simulated curve count too small ({len(sim_curves)}); expected at least 100.")
+if len(exp_curves) < 100:
+    raise ValueError(f"Experimental curve count too small ({len(exp_curves)}); expected at least 100.")
+
+sim_key_text = " ".join(str(k).lower() for k in selected_sim_keys)
+exp_key_text = " ".join(str(k).lower() for k in selected_exp_keys)
+if len(exp_curves) == len(sim_curves):
+    exp_looks_simulated = ("sim" in exp_key_text) and ("exp" not in exp_key_text and "experimental" not in exp_key_text)
+    if exp_looks_simulated:
+        print("WARNING: sim_curves and exp_curves have identical sizes and selected experimental key names look simulated.")
+if len(exp_curves) == 5000:
+    print("WARNING: Experimental set size looks like a simulated block; verify MAT key mapping.")
 
 if MODEL_MODE not in ALLOWED_MODEL_MODES:
     raise ValueError(f"MODEL_MODE must be one of {ALLOWED_MODEL_MODES}, got {MODEL_MODE}")
@@ -3072,6 +3221,10 @@ if CONTROL_MODE == "supervised_voltage":
         "n_blocks": cfg.n_blocks,
         "warmup_epochs": cfg.warmup_epochs,
         "grad_clip_norm": cfg.grad_clip_norm,
+        "selected_sim_keys": selected_sim_keys,
+        "selected_exp_keys": selected_exp_keys,
+        "n_sim_curves": len(sim_curves),
+        "n_exp_curves": len(exp_curves),
         "train_size": len(train_curves),
         "val_size": len(val_curves),
         "test_size": len(test_curves),
