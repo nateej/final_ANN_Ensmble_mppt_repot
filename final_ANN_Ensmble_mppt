@@ -11,6 +11,7 @@
 
 import os
 import random
+import copy
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
@@ -153,6 +154,16 @@ class Config:
     event_trigger_power_delta_ratio: float = 0.02
     event_trigger_voltage_delta_ratio: float = 0.015
     local_track_delta_ratio: float = 0.01
+    iann_region_bins: int = 12
+    iann_hidden_1: int = 48
+    iann_hidden_2: int = 24
+    quantization_calibration_samples: int = 512
+    pso_particles: int = 6
+    pso_iterations: int = 5
+    pso_inertia: float = 0.45
+    pso_cognitive: float = 1.1
+    pso_social: float = 1.3
+    pso_seed_spread: float = 0.04
 
     # training
     val_split: float = 0.15
@@ -992,87 +1003,93 @@ def build_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Config):
 # -------------------------
 # MODEL
 # -------------------------
-class ResidualVhatNet(nn.Module):
-    def __init__(self, in_dim: int, dropout: float = 0.08):
+class IANNRegionNet(nn.Module):
+    """Lightweight ANN classifier for fast GMPP voltage-region recognition."""
+    def __init__(self, in_dim: int, num_regions: int, dropout: float = 0.05, cfg: Optional[Config] = None):
         super().__init__()
+        h1 = cfg.iann_hidden_1 if cfg is not None else 48
+        h2 = cfg.iann_hidden_2 if cfg is not None else 24
+        self.quant = torch.ao.quantization.QuantStub()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
+            nn.Linear(in_dim, h1),
+            nn.ReLU(),
             nn.Dropout(dropout),
-
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(64, 32),
-            nn.GELU(),
-
-            nn.Linear(32, 1),
-            nn.Tanh(),
+            nn.Linear(h1, h2),
+            nn.ReLU(),
+            nn.Linear(h2, num_regions),
         )
+        self.dequant = torch.ao.quantization.DeQuantStub()
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        x = self.quant(x)
+        x = self.net(x)
+        x = self.dequant(x)
+        return x
 
 # -------------------------
 # TRAINING LOSS
 # -------------------------
-def hybrid_weighted_loss(pred_vhat, true_vhat, weights, beta=0.02, pct_weight=0.15):
-    abs_err = torch.abs(pred_vhat - true_vhat)
-    smooth = torch.where(
-        abs_err < beta,
-        0.5 * (abs_err ** 2) / beta,
-        abs_err - 0.5 * beta
-    )
-    pct = abs_err / torch.clamp(torch.abs(true_vhat), min=1e-6)
-    loss = smooth + pct_weight * pct
-    return (loss * weights).mean()
+def weighted_region_cross_entropy(logits, y_region, weights):
+    per_sample_loss = nn.CrossEntropyLoss(reduction="none")(logits, y_region)
+    return (per_sample_loss * weights).mean()
 
-def improvement_aware_loss(
-    pred_vhat,
-    true_vhat,
-    coarse_vhat,
-    weights,
-    beta=0.02,
-    pct_weight=0.15,
-    margin=0.002,
-    beat_weight=0.5,
+def _region_edges(cfg: Config) -> np.ndarray:
+    return np.linspace(0.0, 1.0, cfg.iann_region_bins + 1, dtype=np.float32)
+
+def encode_vhat_regions(y_true_vhat: np.ndarray, cfg: Config) -> np.ndarray:
+    bins = _region_edges(cfg)
+    region_ids = np.digitize(y_true_vhat, bins[1:-1], right=False)
+    return np.clip(region_ids, 0, cfg.iann_region_bins - 1).astype(np.int64)
+
+def region_centers_from_edges(edges: np.ndarray) -> np.ndarray:
+    return 0.5 * (edges[:-1] + edges[1:])
+
+def calibrate_and_quantize_iann(model: nn.Module, calibration_data: np.ndarray) -> nn.Module:
+    model_cpu = model.to("cpu").eval()
+    q_model = copy.deepcopy(model_cpu)
+    q_model.qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
+    torch.ao.quantization.prepare(q_model, inplace=True)
+
+    with torch.no_grad():
+        for row in calibration_data:
+            q_model(torch.tensor(row[None, :], dtype=torch.float32))
+    torch.ao.quantization.convert(q_model, inplace=True)
+    return q_model
+
+def train_one_model(
+    X_tr,
+    y_region_tr,
+    y_vhat_tr,
+    weight_tr,
+    X_va,
+    y_region_va,
+    y_vhat_va,
+    weight_va,
+    cfg: Config,
+    seed_offset: int = 0,
 ):
-    pred_err = torch.abs(pred_vhat - true_vhat)
-    coarse_err = torch.abs(coarse_vhat - true_vhat)
-
-    smooth = torch.where(
-        pred_err < beta,
-        0.5 * (pred_err ** 2) / beta,
-        pred_err - 0.5 * beta
-    )
-
-    pct = pred_err / torch.clamp(torch.abs(true_vhat), min=1e-6)
-
-    # ANN should beat coarse by at least a small margin when possible.
-    # If pred_err is not lower than coarse_err - margin, penalize it.
-    beat_penalty = torch.relu(pred_err - (coarse_err - margin))
-
-    loss = smooth + pct_weight * pct + beat_weight * beat_penalty
-    return (loss * weights).mean()
-
-def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
-                    X_va, true_vhat_va, coarse_vhat_va, weight_va,
-                    residual_scale, cfg: Config, seed_offset: int = 0):
     set_seed(cfg.seed + seed_offset)
 
-    model = ResidualVhatNet(in_dim=X_tr.shape[1], dropout=cfg.dropout).to(cfg.device)
+    model = IANNRegionNet(
+        in_dim=X_tr.shape[1],
+        num_regions=cfg.iann_region_bins,
+        dropout=min(cfg.dropout, 0.05),
+        cfg=cfg,
+    ).to(cfg.device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=cfg.lr_plateau_patience
     )
 
     X_va_t = torch.tensor(X_va, dtype=torch.float32, device=cfg.device)
-    y_va_t = torch.tensor(true_vhat_va, dtype=torch.float32, device=cfg.device)
-    coarse_va_t = torch.tensor(coarse_vhat_va, dtype=torch.float32, device=cfg.device)
+    y_region_va_t = torch.tensor(y_region_va, dtype=torch.long, device=cfg.device)
+    y_vhat_va_t = torch.tensor(y_vhat_va, dtype=torch.float32, device=cfg.device)
     w_va_t = torch.tensor(weight_va, dtype=torch.float32, device=cfg.device)
+    region_centers_t = torch.tensor(
+        region_centers_from_edges(_region_edges(cfg)),
+        dtype=torch.float32,
+        device=cfg.device,
+    )
 
     best_loss = float("inf")
     best_state = None
@@ -1091,28 +1108,12 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
                 continue
 
             xb = torch.tensor(X_tr[batch_idx], dtype=torch.float32, device=cfg.device)
-            yb = torch.tensor(true_vhat_tr[batch_idx], dtype=torch.float32, device=cfg.device)
-            cb = torch.tensor(coarse_vhat_tr[batch_idx], dtype=torch.float32, device=cfg.device)
+            yb_region = torch.tensor(y_region_tr[batch_idx], dtype=torch.long, device=cfg.device)
             wb = torch.tensor(weight_tr[batch_idx], dtype=torch.float32, device=cfg.device)
 
             optimizer.zero_grad()
-            delta_scaled = model(xb)
-            pred_vhat = torch.clamp(cb + residual_scale * delta_scaled, 0.0, 1.0)
-            if cfg.improvement_loss_enabled:
-                loss = improvement_aware_loss(
-                    pred_vhat,
-                    yb,
-                    cb,
-                    wb,
-                    beta=cfg.smoothl1_beta,
-                    pct_weight=cfg.pct_loss_weight,
-                    margin=cfg.improvement_margin_vhat,
-                    beat_weight=cfg.improvement_beat_weight,
-                )
-            else:
-                loss = hybrid_weighted_loss(
-                    pred_vhat, yb, wb, beta=cfg.smoothl1_beta, pct_weight=cfg.pct_loss_weight
-                )
+            logits = model(xb)
+            loss = weighted_region_cross_entropy(logits, yb_region, wb)
             loss.backward()
             optimizer.step()
 
@@ -1123,41 +1124,19 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
 
         model.eval()
         with torch.no_grad():
-            delta_va = model(X_va_t)
-            pred_va = torch.clamp(coarse_va_t + residual_scale * delta_va, 0.0, 1.0)
-            if cfg.improvement_loss_enabled:
-                val_loss = float(
-                    improvement_aware_loss(
-                        pred_va,
-                        y_va_t,
-                        coarse_va_t,
-                        w_va_t,
-                        beta=cfg.smoothl1_beta,
-                        pct_weight=cfg.pct_loss_weight,
-                        margin=cfg.improvement_margin_vhat,
-                        beat_weight=cfg.improvement_beat_weight,
-                    ).detach().cpu()
-                )
-            else:
-                val_loss = float(
-                    hybrid_weighted_loss(
-                        pred_va, y_va_t, w_va_t, beta=cfg.smoothl1_beta, pct_weight=cfg.pct_loss_weight
-                    ).detach().cpu()
-                )
+            logits_va = model(X_va_t)
+            val_loss = float(weighted_region_cross_entropy(logits_va, y_region_va_t, w_va_t).detach().cpu())
+            probs_va = torch.softmax(logits_va, dim=1)
+            pred_va = torch.sum(probs_va * region_centers_t.unsqueeze(0), dim=1)
             val_pct = float(
-                (torch.abs(pred_va - y_va_t) / torch.clamp(torch.abs(y_va_t), min=1e-6)).mean().cpu() * 100.0
+                (torch.abs(pred_va - y_vhat_va_t) / torch.clamp(torch.abs(y_vhat_va_t), min=1e-6)).mean().cpu() * 100.0
             )
-            pred_err_abs = torch.abs(pred_va - y_va_t)
-            coarse_err_abs = torch.abs(coarse_va_t - y_va_t)
-            ann_better_rate = float((pred_err_abs < coarse_err_abs).float().mean().cpu() * 100.0)
-            ann_equal_or_better_rate = float((pred_err_abs <= coarse_err_abs).float().mean().cpu() * 100.0)
-            mean_coarse_err_pct = float(
-                (coarse_err_abs / torch.clamp(torch.abs(y_va_t), min=1e-6)).mean().cpu() * 100.0
-            )
+            pred_class = torch.argmax(logits_va, dim=1)
+            top1_acc = float((pred_class == y_region_va_t).float().mean().cpu() * 100.0)
+            region_abs_err = torch.abs(pred_va - y_vhat_va_t)
             mean_ann_err_pct = float(
-                (pred_err_abs / torch.clamp(torch.abs(y_va_t), min=1e-6)).mean().cpu() * 100.0
+                (region_abs_err / torch.clamp(torch.abs(y_vhat_va_t), min=1e-6)).mean().cpu() * 100.0
             )
-            ann_minus_coarse_pct_points = mean_coarse_err_pct - mean_ann_err_pct
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -1166,11 +1145,8 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
             "train_loss": avg_train_loss,
             "val_loss": val_loss,
             "val_mean_pct_err": val_pct,
-            "val_ann_better_rate": ann_better_rate,
-            "val_ann_equal_or_better_rate": ann_equal_or_better_rate,
-            "val_mean_coarse_err_pct": mean_coarse_err_pct,
+            "val_region_top1_acc_pct": top1_acc,
             "val_mean_ann_err_pct": mean_ann_err_pct,
-            "val_ann_minus_coarse_pct_points": ann_minus_coarse_pct_points,
             "lr": current_lr,
         })
 
@@ -1178,8 +1154,7 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
             f"[model {seed_offset+1}/{cfg.ensemble_size}] "
             f"Epoch {ep:03d} | LR={current_lr:.6f} | train={avg_train_loss:.6f} | "
             f"val={val_loss:.6f} | val_pct={val_pct:.3f}% | "
-            f"better={ann_better_rate:.2f}% | "
-            f"coarse-ann={ann_minus_coarse_pct_points:.3f} pct-pts"
+            f"region_top1={top1_acc:.2f}%"
         )
 
         if val_loss < best_loss - 1e-6:
@@ -1200,8 +1175,8 @@ def train_one_model(X_tr, true_vhat_tr, coarse_vhat_tr, weight_tr,
 def train_ensemble(dataset: Dict[str, np.ndarray], cfg: Config):
     X = dataset["X"]
     y_true_vhat = dataset["y_true_vhat"]
-    coarse_best_vhat = dataset["coarse_best_vhat"]
     difficulty_weight = dataset["difficulty_weight"]
+    y_region = encode_vhat_regions(y_true_vhat, cfg)
 
     idx = np.arange(len(X))
     idx_tr, idx_va = train_test_split(
@@ -1212,8 +1187,8 @@ def train_ensemble(dataset: Dict[str, np.ndarray], cfg: Config):
     X_va = X[idx_va]
     y_tr = y_true_vhat[idx_tr]
     y_va = y_true_vhat[idx_va]
-    coarse_tr = coarse_best_vhat[idx_tr]
-    coarse_va = coarse_best_vhat[idx_va]
+    y_region_tr = y_region[idx_tr]
+    y_region_va = y_region[idx_va]
     w_tr = difficulty_weight[idx_tr]
     w_va = difficulty_weight[idx_va]
 
@@ -1221,22 +1196,13 @@ def train_ensemble(dataset: Dict[str, np.ndarray], cfg: Config):
     X_tr_std = apply_standardizer(X_tr, mu, sd)
     X_va_std = apply_standardizer(X_va, mu, sd)
 
-    delta_train = np.abs(y_tr - coarse_tr)
-    residual_scale = float(
-        max(
-            cfg.residual_scale_min,
-            np.quantile(delta_train, cfg.residual_scale_quantile) * cfg.residual_scale_margin
-        )
-    )
-    residual_scale = min(residual_scale, 0.50)
-    print(f"\nResidual scale (normalized voltage): {residual_scale:.5f}")
+    residual_scale = 0.0
 
     models, histories, best_losses = [], [], []
     for m in range(cfg.ensemble_size):
         model, hist, best_loss = train_one_model(
-            X_tr_std, y_tr, coarse_tr, w_tr,
-            X_va_std, y_va, coarse_va, w_va,
-            residual_scale=residual_scale,
+            X_tr_std, y_region_tr, y_tr, w_tr,
+            X_va_std, y_region_va, y_va, w_va,
             cfg=cfg,
             seed_offset=m,
         )
@@ -1244,27 +1210,37 @@ def train_ensemble(dataset: Dict[str, np.ndarray], cfg: Config):
         histories.append(hist)
         best_losses.append(best_loss)
 
-    return models, mu, sd, histories, best_losses, residual_scale
+    calibration_size = min(len(X_tr_std), cfg.quantization_calibration_samples)
+    calibration_data = X_tr_std[:calibration_size]
+    quantized_models = [calibrate_and_quantize_iann(m, calibration_data) for m in models]
+    return models, mu, sd, histories, best_losses, residual_scale, quantized_models
 
 # -------------------------
 # ENSEMBLE PREDICTION
 # -------------------------
 def predict_vhat_ensemble(models: List[nn.Module], x_std: np.ndarray, coarse_best_vhat: float,
                           residual_scale: float, device: str) -> Dict[str, float]:
-    x_t = torch.tensor(x_std, dtype=torch.float32, device=device)
+    _ = coarse_best_vhat, residual_scale
+    x_t = torch.tensor(x_std, dtype=torch.float32, device="cpu")
     preds = []
+    entropies = []
     for model in models:
         model.eval()
         with torch.no_grad():
-            delta_scaled = float(model(x_t).detach().cpu().numpy().ravel()[0])
-            pred_vhat = np.clip(coarse_best_vhat + residual_scale * delta_scaled, 0.0, 1.0)
-            preds.append(float(pred_vhat))
+            logits = model(x_t).detach().cpu()
+            probs = torch.softmax(logits, dim=1).numpy().ravel()
+            centers = region_centers_from_edges(_region_edges(cfg))
+            pred_vhat = float(np.sum(probs * centers))
+            entropy = float(-(probs * np.log(np.clip(probs, 1e-9, 1.0))).sum())
+            preds.append(pred_vhat)
+            entropies.append(entropy)
     preds = np.asarray(preds, dtype=float)
     return {
         "mean_vhat": float(np.mean(preds)),
         "std_vhat": float(np.std(preds)),
         "min_vhat": float(np.min(preds)),
         "max_vhat": float(np.max(preds)),
+        "mean_entropy": float(np.mean(entropies)),
     }
 
 # -------------------------
@@ -1394,6 +1370,79 @@ def run_targeted_rescue(
 
             p_before = P_best
             V_best, P_best, _ = maybe_update_best(v_eval, p_eval, V_best, P_best)
+            E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+            stats.t_hold_total += hold_dt
+
+    return E, t, V_best, P_best
+
+def run_iann_seeded_pso(
+    oracle: CurveOracle,
+    init_v: float,
+    cfg: Config,
+    E: float,
+    t: float,
+    log: Dict,
+    stats: StageStats,
+    V_best: float,
+    P_best: float,
+):
+    """Lightweight PSO refinement initialized by IANN voltage-region estimate."""
+    Voc = oracle.voc
+    v_min = cfg.sample_fracs_min * Voc
+    v_max = cfg.sample_fracs_max * Voc
+
+    n_particles = max(3, int(cfg.pso_particles))
+    seed_offsets = np.linspace(-cfg.pso_seed_spread, cfg.pso_seed_spread, n_particles)
+    positions = np.clip(init_v * (1.0 + seed_offsets), v_min, v_max)
+    velocities = np.zeros_like(positions)
+    pbest_pos = positions.copy()
+    pbest_pow = np.array([v * oracle.measure(v) for v in pbest_pos], dtype=float)
+
+    gbest_idx = int(np.argmax(pbest_pow))
+    gbest_pos = float(pbest_pos[gbest_idx])
+    gbest_pow = float(pbest_pow[gbest_idx])
+    if gbest_pow > P_best:
+        V_best, P_best = gbest_pos, gbest_pow
+
+    for v_eval, p_eval in zip(pbest_pos, pbest_pow):
+        E, t = add_probe(E, t, float(p_eval), cfg.dt_meas)
+        stats.refine_points += 1
+        stats.t_probe_total += cfg.dt_meas
+        log["meas_V"].append(float(v_eval))
+        log["meas_P"].append(float(p_eval))
+        log["meas_tag"].append("pso_init")
+        p_before = P_best
+        V_best, P_best, _ = maybe_update_best(float(v_eval), float(p_eval), V_best, P_best)
+        E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
+        stats.t_hold_total += hold_dt
+
+    for _ in range(max(1, int(cfg.pso_iterations))):
+        for idx in range(n_particles):
+            r1 = np.random.rand()
+            r2 = np.random.rand()
+            velocities[idx] = (
+                cfg.pso_inertia * velocities[idx]
+                + cfg.pso_cognitive * r1 * (pbest_pos[idx] - positions[idx])
+                + cfg.pso_social * r2 * (gbest_pos - positions[idx])
+            )
+            positions[idx] = float(np.clip(positions[idx] + velocities[idx], v_min, v_max))
+
+            p_eval = float(positions[idx] * oracle.measure(positions[idx]))
+            if p_eval > pbest_pow[idx]:
+                pbest_pow[idx] = p_eval
+                pbest_pos[idx] = positions[idx]
+            if p_eval > gbest_pow:
+                gbest_pow = p_eval
+                gbest_pos = float(positions[idx])
+
+            E, t = add_probe(E, t, p_eval, cfg.dt_meas)
+            stats.refine_points += 1
+            stats.t_probe_total += cfg.dt_meas
+            log["meas_V"].append(float(positions[idx]))
+            log["meas_P"].append(float(p_eval))
+            log["meas_tag"].append("pso_iter")
+            p_before = P_best
+            V_best, P_best, _ = maybe_update_best(float(positions[idx]), p_eval, V_best, P_best)
             E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
             stats.t_hold_total += hold_dt
 
@@ -1878,38 +1927,18 @@ def run_global_gmppt_episode_logged(
     E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
     stats.t_hold_total += hold_dt
 
-    # 3) local refine
-    delta = cfg.delta_local
-    for _ in range(max_refine_iterations):
-        p_round_start = P_best
-        improved = False
-        candidates = [
-            float(np.clip(V_best * (1.0 - delta), cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc)),
-            float(np.clip(V_best * (1.0 + delta), cfg.sample_fracs_min * Voc, cfg.sample_fracs_max * Voc)),
-        ]
-        for vq in candidates:
-            pq = vq * oracle.measure(vq)
-            E, t = add_probe(E, t, pq, cfg.dt_meas)
-            stats.refine_points += 1
-            stats.t_probe_total += cfg.dt_meas
-            log["meas_V"].append(float(vq))
-            log["meas_P"].append(float(pq))
-            log["meas_tag"].append("local_refine")
-            old_p = P_best
-            V_best, P_best, better = maybe_update_best(float(vq), float(pq), V_best, P_best)
-            improved = improved or better or (P_best > old_p)
-            E, t, hold_dt = add_adaptive_hold(E, t, old_p, P_best, cfg)
-            stats.t_hold_total += hold_dt
-
-        round_gain = (P_best - p_round_start) / max(p_round_start, 1e-9)
-        if round_gain < cfg.min_refine_gain_ratio:
-            break
-
-        if not improved:
-            if delta > 0.0125:
-                delta /= 2.0
-            else:
-                break
+    # 3) IANN-seeded PSO refine
+    E, t, V_best, P_best = run_iann_seeded_pso(
+        oracle=oracle,
+        init_v=V_target,
+        cfg=cfg,
+        E=E,
+        t=t,
+        log=log,
+        stats=stats,
+        V_best=V_best,
+        P_best=P_best,
+    )
 
     # 4) dual-peak rescue
     dual_peak_trigger = ambiguous_case or uncertain_ann
@@ -2636,7 +2665,7 @@ def evaluate_loss_ablation(exp_curves, dataset, cfg):
     improved_cfg.residual_scale_margin = 1.00
 
     # Train baseline
-    baseline_models, baseline_mu, baseline_sd, baseline_histories, baseline_best_losses, baseline_residual_scale = train_ensemble(dataset, baseline_cfg)
+    baseline_models, baseline_mu, baseline_sd, baseline_histories, baseline_best_losses, baseline_residual_scale, _ = train_ensemble(dataset, baseline_cfg)
     print("\nBaseline loss best validation loss per model:")
     for i, loss in enumerate(baseline_best_losses, 1):
         print(f"  model {i}: {loss:.6f}")
@@ -2646,7 +2675,7 @@ def evaluate_loss_ablation(exp_curves, dataset, cfg):
     )
 
     # Train improved-loss version
-    improved_models, improved_mu, improved_sd, improved_histories, improved_best_losses, improved_residual_scale = train_ensemble(dataset, improved_cfg)
+    improved_models, improved_mu, improved_sd, improved_histories, improved_best_losses, improved_residual_scale, _ = train_ensemble(dataset, improved_cfg)
     print("\nImprovement-aware loss best validation loss per model:")
     for i, loss in enumerate(improved_best_losses, 1):
         print(f"  model {i}: {loss:.6f}")
@@ -3249,7 +3278,7 @@ def _predict_ann_vhat_for_curve(curve_item, trained, cfg: Config):
     v_plot, i_plot = oracle.curve_for_plot()
     feat = build_feature_vector(v_plot, i_plot, cfg.sample_fracs)
     if trained["kind"] == "mlp":
-        models, mu, sd, _, _, residual_scale = trained["bundle"]
+        models, mu, sd, _, _, residual_scale, _ = trained["bundle"]
         x_std = (feat["x"] - mu) / sd
         ens = predict_vhat_ensemble(models, x_std, float(feat["coarse_best_vhat"]), residual_scale, cfg.device)
         return float(ens["pred_vhat_mean"])
@@ -3494,7 +3523,7 @@ if RUN_MODE == "baseline":
         "run_mode": RUN_MODE,
         "controller_eval": "run_hybrid_episode_logged_baseline",
         "power_first_eval_only": True,
-        "baseline_pipeline": "12-point coarse -> ANN probe -> local refine -> wide fallback",
+        "baseline_pipeline": "12-point coarse -> IANN region seed -> PSO refine -> wide fallback",
         "baseline_disabled_features": [
             "trust_gate_split",
             "loss_ablation",
@@ -3512,7 +3541,7 @@ if RUN_MODE == "baseline":
     print("\n=== EXPERIMENT MANIFEST ===")
     print(experiment_manifest)
     print("\nTraining baseline ANN ensemble (original loss only)...")
-    models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, run_cfg)
+    models, mu, sd, histories, best_losses, residual_scale, quantized_models = train_ensemble(dataset, run_cfg)
 
     eval_curves = exp_curves
     summary, df_results, examples = evaluate_unseen_300(
@@ -3549,6 +3578,7 @@ if RUN_MODE == "baseline":
             "sd": sd,
             "residual_scale": residual_scale,
             "state_dicts": [m.state_dict() for m in models],
+            "quantized_state_dicts_int8": [m.state_dict() for m in quantized_models],
             "preprocess_stats": preprocess_stats,
             "summary": summary,
         }
@@ -3578,7 +3608,7 @@ else:
     print("\n=== EXPERIMENT MANIFEST ===")
     print(experiment_manifest)
     print("\nTraining extended ANN ensemble...")
-    models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, run_cfg)
+    models, mu, sd, histories, best_losses, residual_scale, quantized_models = train_ensemble(dataset, run_cfg)
 
     trust_gate_model = None
     trust_gate_feature_names = None
@@ -3664,6 +3694,7 @@ else:
             "sd": sd,
             "residual_scale": residual_scale,
             "state_dicts": [m.state_dict() for m in models],
+            "quantized_state_dicts_int8": [m.state_dict() for m in quantized_models],
             "preprocess_stats": preprocess_stats,
             "summary": summary,
             "trust_threshold": trust_threshold,
