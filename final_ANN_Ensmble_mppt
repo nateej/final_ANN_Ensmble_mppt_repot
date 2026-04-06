@@ -35,6 +35,10 @@ try:
     from scipy.io import loadmat
 except Exception:
     loadmat = None
+try:
+    from scipy.optimize import least_squares
+except Exception:
+    least_squares = None
 
 # -------------------------
 # USER CONFIG
@@ -2493,11 +2497,113 @@ def augment_curve_psc(v: np.ndarray, i: np.ndarray, rng: np.random.Generator, te
             i2[a:b] *= float(rng.uniform(0.4, 0.8))
     return v2, np.maximum(i2, 0.0)
 
+def fit_effective_single_diode_params(v, i, voc, isc):
+    if least_squares is None:
+        return None
+    v = np.asarray(v, dtype=float).ravel()
+    i = np.asarray(i, dtype=float).ravel()
+    if len(v) < 5 or len(i) != len(v):
+        return None
+    if not np.isfinite(voc) or not np.isfinite(isc) or voc <= 0 or isc <= 0:
+        return None
+
+    il0 = max(float(isc), 1e-6)
+    i00 = max(1e-10, il0 * np.exp(-voc / max(voc / 20.0, 0.5)))
+    rs0 = 0.02 * max(voc / isc, 1e-3)
+    rsh0 = 20.0 * max(voc / isc, 1e-3)
+    nnsvth0 = max(voc / 25.0, 0.5)
+
+    x0 = np.array([il0, i00, rs0, rsh0, nnsvth0], dtype=float)
+    lb = np.array([1e-8, 1e-14, 0.0, 1e-3, 1e-2], dtype=float)
+    ub = np.array([10.0 * il0 + 1.0, 1e-2, 10.0 * max(voc / isc, 1e-3), 1e6, 10.0 * voc + 5.0], dtype=float)
+
+    def residuals(x):
+        il, i0, rs, rsh, nnsvth = x
+        z = (v + i * rs) / max(nnsvth, 1e-8)
+        z = np.clip(z, -60.0, 60.0)
+        i_model = il - i0 * (np.exp(z) - 1.0) - (v + i * rs) / max(rsh, 1e-8)
+        return i - i_model
+
+    try:
+        sol = least_squares(residuals, x0=x0, bounds=(lb, ub), max_nfev=4000, method="trf")
+    except Exception:
+        return None
+    if not sol.success or sol.x is None or not np.all(np.isfinite(sol.x)):
+        return None
+
+    il, i0, rs, rsh, nnsvth = [float(x) for x in sol.x]
+    if il <= 0 or i0 <= 0 or rs < 0 or rsh <= 0 or nnsvth <= 0:
+        return None
+    return {"il": il, "i0": i0, "rs": rs, "rsh": rsh, "nNsVth": nnsvth}
+
+def _to_float_or_none(v):
+    try:
+        x = float(np.asarray(v).reshape(-1)[0])
+    except Exception:
+        return None
+    if not np.isfinite(x):
+        return None
+    return x
+
+def _extract_curve_aux_params(curve, v, i, voc, isc):
+    lower_map = {}
+    if isinstance(curve, dict):
+        for k, val in curve.items():
+            lower_map[str(k).lower()] = val
+        params_obj = curve.get("params", None)
+        if isinstance(params_obj, dict):
+            for k, val in params_obj.items():
+                lower_map[str(k).lower()] = val
+
+    def pick(*aliases):
+        for a in aliases:
+            if a in lower_map:
+                got = _to_float_or_none(lower_map[a])
+                if got is not None:
+                    return got
+        return None
+
+    out = {
+        "voc": pick("voc", "v_oc"),
+        "isc": pick("isc", "i_sc"),
+        "temperature": pick("temperature", "temp", "t", "cell_temperature", "cell_temp"),
+        "il": pick("il", "iph", "i_ph", "photo_current"),
+        "i0": pick("i0", "io", "isat", "i_sat", "saturation_current"),
+        "rs": pick("rs", "r_s", "series_resistance"),
+        "rsh": pick("rsh", "r_sh", "shunt_resistance"),
+        "nNsVth": pick("nnsvth", "n_nsvth", "nnsvth", "nvt", "a"),
+    }
+    out["voc"] = out["voc"] if out["voc"] is not None and out["voc"] > 0 else float(voc)
+    out["isc"] = out["isc"] if out["isc"] is not None and out["isc"] > 0 else float(isc)
+    out["temperature"] = out["temperature"] if out["temperature"] is not None else 25.0
+
+    need_fit = any(out[k] is None for k in ("il", "i0", "rs", "rsh", "nNsVth"))
+    fit_ok = True
+    if need_fit:
+        fit = fit_effective_single_diode_params(v, i, out["voc"], out["isc"])
+        if fit is None:
+            fit_ok = False
+            fit = {
+                "il": max(out["isc"], 1e-6),
+                "i0": 1e-10,
+                "rs": 0.01 * max(out["voc"] / max(out["isc"], 1e-6), 1e-3),
+                "rsh": 50.0 * max(out["voc"] / max(out["isc"], 1e-6), 1e-3),
+                "nNsVth": max(out["voc"] / 25.0, 0.5),
+            }
+        for k in ("il", "i0", "rs", "rsh", "nNsVth"):
+            out[k] = float(fit[k])
+
+    for k in ("il", "i0", "rs", "rsh", "nNsVth"):
+        if out[k] is None:
+            fit_ok = False
+            break
+    return out, fit_ok
+
 def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Config, augment=False, test_only_unseen=False):
     X_seq, y_vhat, y_power, y_coarse = [], [], [], []
     meta = {"coarse_ratio_pct": [], "coarse_diff_pct": [], "multi_peak_count": [], "ambiguity_flag": []}
     rng = np.random.default_rng(cfg.seed + (13 if augment else 0))
-    aux = {"voc": [], "isc": [], "rs": [], "rsh": [], "temperature": []}
+    aux = {"voc": [], "isc": [], "temperature": [], "il": [], "i0": [], "rs": [], "rsh": [], "nNsVth": [], "valid_pinn": []}
 
     for item in list(iter_curve_items(curves)):
         v_raw, i_raw = extract_vi(item)
@@ -2539,11 +2645,16 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
         meta["coarse_diff_pct"].append(np.float32(100.0 * abs((coarse_v - oracle.vmpp_true) / max(oracle.vmpp_true, 1e-9))))
         meta["multi_peak_count"].append(np.float32(feat["multi_peak_count"]))
         meta["ambiguity_flag"].append(np.float32(feat["ambiguity_flag"]))
-        aux["voc"].append(np.float32(oracle.voc))
-        aux["isc"].append(np.float32(oracle.isc))
-        aux["rs"].append(np.float32(np.nan))
-        aux["rsh"].append(np.float32(np.nan))
-        aux["temperature"].append(np.float32(np.nan))
+        aux_curve, fit_ok = _extract_curve_aux_params(item, v, i, voc=float(oracle.voc), isc=float(oracle.isc))
+        aux["voc"].append(np.float32(aux_curve["voc"]))
+        aux["isc"].append(np.float32(aux_curve["isc"]))
+        aux["temperature"].append(np.float32(aux_curve["temperature"]))
+        aux["il"].append(np.float32(aux_curve["il"]))
+        aux["i0"].append(np.float32(aux_curve["i0"]))
+        aux["rs"].append(np.float32(aux_curve["rs"]))
+        aux["rsh"].append(np.float32(aux_curve["rsh"]))
+        aux["nNsVth"].append(np.float32(aux_curve["nNsVth"]))
+        aux["valid_pinn"].append(np.float32(1.0 if fit_ok else 0.0))
 
     return {
         "X_seq": np.asarray(X_seq, dtype=np.float32),
@@ -2551,7 +2662,15 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
         "y_power_true": np.asarray(y_power, dtype=np.float32),
         "y_coarse_vhat": np.asarray(y_coarse, dtype=np.float32),
         **{k: np.asarray(v, dtype=np.float32) for k, v in meta.items()},
-        **{f"aux_{k}": np.asarray(v, dtype=np.float32) for k, v in aux.items()},
+        "aux_voc": np.asarray(aux["voc"], dtype=np.float32),
+        "aux_isc": np.asarray(aux["isc"], dtype=np.float32),
+        "aux_temperature": np.asarray(aux["temperature"], dtype=np.float32),
+        "aux_il": np.asarray(aux["il"], dtype=np.float32),
+        "aux_i0": np.asarray(aux["i0"], dtype=np.float32),
+        "aux_rs": np.asarray(aux["rs"], dtype=np.float32),
+        "aux_rsh": np.asarray(aux["rsh"], dtype=np.float32),
+        "aux_nNsVth": np.asarray(aux["nNsVth"], dtype=np.float32),
+        "aux_valid_pinn": np.asarray(aux["valid_pinn"], dtype=np.float32),
     }
 
 # -------------------------
@@ -2601,6 +2720,26 @@ def estimate_power_at_predicted_vhat(pred_vhat, seq_x):
     p_pick = p[torch.arange(p.shape[0], device=p.device), idx]
     return p_pick
 
+def interpolate_current_from_seq(pred_vhat, seq_x, aux_params: Dict[str, torch.Tensor]):
+    v_grid = seq_x[:, :, 0]
+    i_norm_grid = seq_x[:, :, 1]
+    voc = torch.clamp(aux_params["voc"], min=1e-6)
+    isc = torch.clamp(aux_params["isc"], min=1e-6)
+    pred_vhat_clamped = torch.clamp(pred_vhat, 0.0, 1.0)
+
+    idx_hi = torch.searchsorted(v_grid, pred_vhat_clamped.unsqueeze(-1), right=False).squeeze(-1)
+    idx_hi = torch.clamp(idx_hi, 1, v_grid.shape[1] - 1)
+    idx_lo = idx_hi - 1
+    b = torch.arange(v_grid.shape[0], device=seq_x.device)
+
+    v0 = v_grid[b, idx_lo]
+    v1 = v_grid[b, idx_hi]
+    i0 = i_norm_grid[b, idx_lo]
+    i1 = i_norm_grid[b, idx_hi]
+    t = (pred_vhat_clamped - v0) / torch.clamp(v1 - v0, min=1e-6)
+    i_norm_pred = i0 + t * (i1 - i0)
+    return i_norm_pred * isc, pred_vhat_clamped * voc
+
 def supervised_power_first_loss(pred_vhat, true_vhat, true_power_ratio, coarse_vhat, seq_x, cfg: Config):
     pred_power_ratio = estimate_power_at_predicted_vhat(pred_vhat, seq_x)
     coarse_power_ratio = estimate_power_at_predicted_vhat(coarse_vhat, seq_x)
@@ -2610,35 +2749,46 @@ def supervised_power_first_loss(pred_vhat, true_vhat, true_power_ratio, coarse_v
     total = cfg.w_v * l_voltage + cfg.w_p * l_power + cfg.w_rank * l_rank
     return total, {"L_voltage": l_voltage.item(), "L_power": l_power.item(), "L_rank": l_rank.item()}
 
-def pinn_loss(pred_vhat, true_vhat, true_power_ratio, coarse_vhat, seq_x, cfg: Config):
-    pred_vhat = pred_vhat.requires_grad_(True)
+def pinn_loss(pred_vhat, true_vhat, true_power_ratio, coarse_vhat, seq_x, cfg: Config, aux_params: Dict[str, torch.Tensor]):
     pred_power_ratio = estimate_power_at_predicted_vhat(pred_vhat, seq_x)
     l_voltage = nn.SmoothL1Loss()(pred_vhat, true_vhat)
     l_power = nn.SmoothL1Loss()(pred_power_ratio, true_power_ratio)
-    grad = torch.autograd.grad(pred_power_ratio.sum(), pred_vhat, create_graph=True, retain_graph=True)[0]
-    l_mpp = (grad ** 2).mean()
+    residual = single_diode_residual(pred_vhat, seq_x, aux_params)
+    l_phys = (residual ** 2).mean()
+    i_pred, v_pred = interpolate_current_from_seq(pred_vhat, seq_x, aux_params)
+    pred_power = v_pred * i_pred
+    dP_dVhat = torch.autograd.grad(pred_power.sum(), pred_vhat, create_graph=True, retain_graph=True)[0]
+    l_mpp = (dP_dVhat ** 2).mean()
     l_bound = (torch.relu(-pred_vhat) + torch.relu(pred_vhat - 1.0)).mean()
-    l_phys = ((pred_power_ratio - seq_x[:, :, 2].max(dim=1).values) ** 2).mean()
     total = cfg.w_data * (l_voltage + l_power) + cfg.w_phys * l_phys + cfg.w_mpp * l_mpp + cfg.w_bound * l_bound
-    return total
+    metrics = {
+        "l_voltage": l_voltage.detach(),
+        "l_power": l_power.detach(),
+        "l_phys": l_phys.detach(),
+        "l_mpp": l_mpp.detach(),
+        "l_bound": l_bound.detach(),
+    }
+    return total, metrics
 
-def single_diode_residual(pred_vhat, seq_x, cfg: Config, aux_params: Dict[str, torch.Tensor]):
-    if aux_params is None:
-        raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
-    required = ("voc", "isc")
+def single_diode_residual(pred_vhat, seq_x, aux_params: Dict[str, torch.Tensor]):
+    required = ("voc", "isc", "il", "i0", "rs", "rsh", "nNsVth")
     for k in required:
         if k not in aux_params:
-            raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
-        if torch.isnan(aux_params[k]).any():
-            raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
-    raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
+            raise ValueError(f"Missing PINN auxiliary parameter: {k}")
+    i_pred, v_pred = interpolate_current_from_seq(pred_vhat, seq_x, aux_params)
+    il = aux_params["il"]
+    i0 = torch.clamp(aux_params["i0"], min=1e-14)
+    rs = torch.clamp(aux_params["rs"], min=0.0)
+    rsh = torch.clamp(aux_params["rsh"], min=1e-6)
+    nnsvth = torch.clamp(aux_params["nNsVth"], min=1e-6)
+    exp_arg = torch.clamp((v_pred + i_pred * rs) / nnsvth, min=-60.0, max=60.0)
+    i_sde = il - i0 * (torch.exp(exp_arg) - 1.0) - (v_pred + i_pred * rs) / rsh
+    return i_pred - i_sde
 
 # -------------------------
 # train_eval.py
 # -------------------------
 def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarray], cfg: Config):
-    if cfg.model_mode == "mamba_pinn":
-        raise ValueError("mamba_pinn is not enabled until real diode-physics residuals are implemented")
     if cfg.model_mode == "mlp_baseline":
         flat_dataset = build_dataset_from_curves(train_data["curves"], cfg.sample_fracs, cfg)
         return {"kind": "mlp", "bundle": train_ensemble(flat_dataset, cfg)}
@@ -2647,11 +2797,41 @@ def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarra
     yv_tr = torch.tensor(train_data["y_vhat_true"], dtype=torch.float32, device=cfg.device)
     yp_tr = torch.tensor(train_data["y_power_true"], dtype=torch.float32, device=cfg.device)
     yc_tr = torch.tensor(train_data["y_coarse_vhat"], dtype=torch.float32, device=cfg.device)
+    aux_tr_all = None
 
     x_va = torch.tensor(val_data["X_seq"], dtype=torch.float32, device=cfg.device)
     yv_va = torch.tensor(val_data["y_vhat_true"], dtype=torch.float32, device=cfg.device)
     yp_va = torch.tensor(val_data["y_power_true"], dtype=torch.float32, device=cfg.device)
     yc_va = torch.tensor(val_data["y_coarse_vhat"], dtype=torch.float32, device=cfg.device)
+    aux_va_all = None
+
+    if cfg.model_mode == "mamba_pinn":
+        tr_mask = np.asarray(train_data.get("aux_valid_pinn", np.ones(len(train_data["X_seq"]))), dtype=np.float32) > 0.5
+        va_mask = np.asarray(val_data.get("aux_valid_pinn", np.ones(len(val_data["X_seq"]))), dtype=np.float32) > 0.5
+        if tr_mask.sum() == 0:
+            raise ValueError("No valid PINN curves in training payload after diode-parameter validation.")
+        if va_mask.sum() == 0:
+            raise ValueError("No valid PINN curves in validation payload after diode-parameter validation.")
+
+        x_tr = x_tr[torch.tensor(tr_mask, dtype=torch.bool, device=cfg.device)]
+        yv_tr = yv_tr[torch.tensor(tr_mask, dtype=torch.bool, device=cfg.device)]
+        yp_tr = yp_tr[torch.tensor(tr_mask, dtype=torch.bool, device=cfg.device)]
+        yc_tr = yc_tr[torch.tensor(tr_mask, dtype=torch.bool, device=cfg.device)]
+        x_va = x_va[torch.tensor(va_mask, dtype=torch.bool, device=cfg.device)]
+        yv_va = yv_va[torch.tensor(va_mask, dtype=torch.bool, device=cfg.device)]
+        yp_va = yp_va[torch.tensor(va_mask, dtype=torch.bool, device=cfg.device)]
+        yc_va = yc_va[torch.tensor(va_mask, dtype=torch.bool, device=cfg.device)]
+
+        def _aux_to_tensors(payload, mask):
+            keys = ("voc", "isc", "temperature", "il", "i0", "rs", "rsh", "nNsVth")
+            out = {}
+            for k in keys:
+                arr = np.asarray(payload[f"aux_{k}"], dtype=np.float32)[mask]
+                out[k] = torch.tensor(arr, dtype=torch.float32, device=cfg.device)
+            return out
+
+        aux_tr_all = _aux_to_tensors(train_data, tr_mask)
+        aux_va_all = _aux_to_tensors(val_data, va_mask)
 
     model = MambaVhatNet(in_features=x_tr.shape[-1], d_model=cfg.d_model, n_blocks=cfg.n_blocks, dropout=cfg.seq_dropout).to(cfg.device)
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -2669,13 +2849,22 @@ def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarra
     for ep in range(cfg.epochs):
         model.train()
         perm = torch.randperm(x_tr.shape[0], device=cfg.device)
+        ep_logs = {"loss": [], "l_voltage": [], "l_power": [], "l_phys": [], "l_mpp": [], "l_bound": []}
         for st in range(0, x_tr.shape[0], bs):
             bi = perm[st:st + bs]
             xb, yvb, ypb, ycb = x_tr[bi], yv_tr[bi], yp_tr[bi], yc_tr[bi]
             opt.zero_grad()
             pred = model(xb)
             if cfg.model_mode == "mamba_pinn":
-                loss = pinn_loss(pred, yvb, ypb, ycb, xb, cfg)
+                pred = pred.requires_grad_(True)
+                aux_b = {k: v[bi] for k, v in aux_tr_all.items()}
+                loss, ldict = pinn_loss(pred, yvb, ypb, ycb, xb, cfg, aux_b)
+                ep_logs["loss"].append(float(loss.detach().cpu()))
+                ep_logs["l_voltage"].append(float(ldict["l_voltage"].cpu()))
+                ep_logs["l_power"].append(float(ldict["l_power"].cpu()))
+                ep_logs["l_phys"].append(float(ldict["l_phys"].cpu()))
+                ep_logs["l_mpp"].append(float(ldict["l_mpp"].cpu()))
+                ep_logs["l_bound"].append(float(ldict["l_bound"].cpu()))
             else:
                 loss, _ = supervised_power_first_loss(pred, yvb, ypb, ycb, xb, cfg)
             loss.backward()
@@ -2685,17 +2874,29 @@ def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarra
 
         model.eval()
         with torch.no_grad():
-            pv = model(x_va)
-            if cfg.model_mode == "mamba_pinn":
-                vloss = nn.SmoothL1Loss()(pv, yv_va).item()
-            else:
+            if cfg.model_mode != "mamba_pinn":
+                pv = model(x_va)
                 vloss = supervised_power_first_loss(pv, yv_va, yp_va, yc_va, x_va, cfg)[0].item()
+            else:
+                vloss = 1e9
+        if cfg.model_mode == "mamba_pinn":
+            with torch.enable_grad():
+                pv = model(x_va).requires_grad_(True)
+                vloss, _ = pinn_loss(pv, yv_va, yp_va, yc_va, x_va, cfg, aux_va_all)
+                vloss = float(vloss.detach().cpu())
+            if len(ep_logs["loss"]) > 0:
+                print(
+                    f"[PINN][epoch {ep+1}/{cfg.epochs}] total={np.mean(ep_logs['loss']):.6f} "
+                    f"l_voltage={np.mean(ep_logs['l_voltage']):.6f} l_power={np.mean(ep_logs['l_power']):.6f} "
+                    f"l_phys={np.mean(ep_logs['l_phys']):.6f} l_mpp={np.mean(ep_logs['l_mpp']):.6f} "
+                    f"l_bound={np.mean(ep_logs['l_bound']):.6f}"
+                )
         if vloss < best[0]:
             best = (vloss, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
 
     if best[1] is not None:
         model.load_state_dict(best[1])
-    return {"kind": cfg.model_mode, "model": model}
+    return {"kind": cfg.model_mode, "model": model, "train_success": True}
 
 def _predict_ann_vhat_for_curve(curve_item, trained, cfg: Config):
     oracle = CurveOracle(curve_item)
@@ -2766,6 +2967,9 @@ def evaluate_supervised_ann(test_curves, trained, cfg: Config):
 def run_ablations(sim_test_curves, exp_curves, trained_models_by_mode, cfg: Config):
     rows = []
     for mode_name, trained in trained_models_by_mode.items():
+        if mode_name == "mamba_pinn" and not bool(trained.get("train_success", False)):
+            print("Skipping mamba_pinn in ablations because training was not successful.")
+            continue
         sim_summary, _ = evaluate_ann_only(sim_test_curves, trained, cfg)
         exp_summary, _ = evaluate_ann_only(exp_curves, trained, cfg)
         if len(sim_summary) == 0 or len(exp_summary) == 0:
