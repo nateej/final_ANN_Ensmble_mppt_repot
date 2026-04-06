@@ -25,11 +25,59 @@ from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from IPython.display import display
 
-# Colab install helper (run in notebook cell before imports if needed):
-# !pip install -q "mamba-ssm[causal-conv1d]"
-# If that fails:
-# !pip install -q causal-conv1d>=1.4.0
-# !pip install -q mamba-ssm --no-build-isolation
+
+def _run_colab_pip_install(install_args: str) -> bool:
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+    except Exception:
+        ip = None
+    try:
+        if ip is not None:
+            ip.run_line_magic("pip", f"install -q {install_args}")
+        else:
+            import subprocess, sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *install_args.split()])
+        return True
+    except Exception:
+        return False
+
+
+def ensure_mamba_runtime_install():
+    if not torch.cuda.is_available():
+        print("CUDA runtime not available; skipping mamba-ssm install and using fallback sequence block.")
+        return False
+
+    try:
+        import mamba_ssm  # noqa: F401
+        print("mamba-ssm already available.")
+        return True
+    except Exception:
+        pass
+
+    base_install_ok = _run_colab_pip_install('"mamba-ssm[causal-conv1d]"')
+    if not base_install_ok:
+        _run_colab_pip_install("causal-conv1d>=1.4.0")
+        _run_colab_pip_install("mamba-ssm --no-build-isolation")
+
+    import importlib, site, sys
+    _ = site, sys
+    importlib.invalidate_caches()
+
+    try:
+        import mamba_ssm  # noqa: F401
+        print("mamba-ssm installed successfully.")
+        return True
+    except Exception:
+        print("mamba-ssm install failed; using fallback sequence block.")
+        return False
+
+
+MAMBA_AVAILABLE = ensure_mamba_runtime_install()
+print(
+    f"Runtime startup manifest: torch={torch.__version__}, "
+    f"cuda_available={torch.cuda.is_available()}, "
+    f"runtime_path={'native_mamba' if MAMBA_AVAILABLE else 'fallback_sequence_block'}"
+)
 
 try:
     from scipy.io import loadmat
@@ -2676,9 +2724,9 @@ def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Co
 # -------------------------
 # models.py
 # -------------------------
-try:
+if MAMBA_AVAILABLE:
     from mamba_ssm import Mamba  # type: ignore
-except Exception:
+else:
     Mamba = None
 
 class _FallbackMambaBlock(nn.Module):
@@ -2690,8 +2738,16 @@ class _FallbackMambaBlock(nn.Module):
         return self.ln(x + self.ff(x))
 
 class MambaVhatNet(nn.Module):
+    _backend_message_printed = False
+
     def __init__(self, in_features: int, d_model: int = 64, n_blocks: int = 2, dropout: float = 0.05):
         super().__init__()
+        if not MambaVhatNet._backend_message_printed:
+            if Mamba is not None:
+                print("MambaVhatNet backend: using native mamba-ssm blocks.")
+            else:
+                print("MambaVhatNet backend: using fallback sequence blocks.")
+            MambaVhatNet._backend_message_printed = True
         self.proj = nn.Linear(in_features, d_model)
         blocks = []
         for _ in range(int(n_blocks)):
@@ -3001,6 +3057,9 @@ if MODEL_MODE not in ALLOWED_MODEL_MODES:
     raise ValueError(f"MODEL_MODE must be one of {ALLOWED_MODEL_MODES}, got {MODEL_MODE}")
 if CONTROL_MODE not in ALLOWED_CONTROL_MODES:
     raise ValueError(f"CONTROL_MODE must be one of {ALLOWED_CONTROL_MODES}, got {CONTROL_MODE}")
+
+if MODEL_MODE in ("mamba_supervised", "mamba_pinn") and not MAMBA_AVAILABLE:
+    print("Running sequence model without native mamba-ssm; fallback block is active, so results are not a true Mamba benchmark.")
 
 if CONTROL_MODE == "supervised_voltage":
     train_curves, val_curves, test_curves = split_curves_train_val_test(sim_curves, seed=cfg.seed)
