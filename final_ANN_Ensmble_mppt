@@ -428,21 +428,104 @@ def iter_curve_items(curves):
     for item in arr.ravel():
         yield item
 
+def unwrap_mat_curve(curve, max_depth=8):
+    obj = curve
+    for _ in range(max_depth):
+        if obj is None:
+            return None
+        # Python dict with direct v/i
+        if isinstance(obj, dict) and ("v" in obj and "i" in obj):
+            return obj
+
+        arr = np.asarray(obj, dtype=object)
+
+        # scalar object cell -> unwrap
+        if arr.ndim == 0:
+            obj = arr.item()
+            continue
+
+        # singleton MATLAB cell wrappers like (1,1), (1,), or nested object cells
+        if arr.dtype == object and arr.size == 1:
+            obj = arr.reshape(-1)[0]
+            continue
+
+        # already looks numeric and matrix-like
+        arr_num = np.asarray(obj)
+        if arr_num.ndim == 2 and (arr_num.shape[0] == 2 or arr_num.shape[1] == 2):
+            return arr_num
+
+        # one more common case: object array row/col containing a single numeric matrix
+        if arr.dtype == object and (arr.ndim == 1 or arr.ndim == 2):
+            flat = arr.reshape(-1)
+            if len(flat) == 1:
+                obj = flat[0]
+                continue
+
+        return obj
+    return obj
+
+
 def extract_vi(curve) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     if curve is None:
         return None, None
 
-    if isinstance(curve, dict) and "v" in curve and "i" in curve:
-        return np.asarray(curve["v"], dtype=float).ravel(), np.asarray(curve["i"], dtype=float).ravel()
-
-    c = np.asarray(curve)
-    if c.ndim != 2:
+    curve = unwrap_mat_curve(curve)
+    if curve is None:
         return None, None
-    if c.shape[0] == 2:
-        return np.asarray(c[0], dtype=float).ravel(), np.asarray(c[1], dtype=float).ravel()
-    if c.shape[1] == 2:
-        return np.asarray(c[:, 0], dtype=float).ravel(), np.asarray(c[:, 1], dtype=float).ravel()
+
+    # direct dict path
+    if isinstance(curve, dict):
+        lower_keys = {str(k).lower(): k for k in curve.keys()}
+        if "v" in lower_keys and "i" in lower_keys:
+            v = np.asarray(curve[lower_keys["v"]], dtype=float).ravel()
+            i = np.asarray(curve[lower_keys["i"]], dtype=float).ravel()
+            return v, i
+
+    arr = np.asarray(curve)
+
+    # if still object-wrapped, try one more recursive unwrap
+    if arr.dtype == object:
+        flat = arr.reshape(-1)
+        for item in flat:
+            maybe = unwrap_mat_curve(item)
+            maybe_arr = np.asarray(maybe)
+            if maybe_arr.ndim == 2 and (maybe_arr.shape[0] == 2 or maybe_arr.shape[1] == 2):
+                arr = maybe_arr
+                break
+
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim != 2:
+        return None, None
+
+    # standard 2 x N
+    if arr.shape[0] == 2 and arr.shape[1] >= 2:
+        return arr[0].ravel(), arr[1].ravel()
+
+    # standard N x 2
+    if arr.shape[1] == 2 and arr.shape[0] >= 2:
+        return arr[:, 0].ravel(), arr[:, 1].ravel()
+
     return None, None
+
+
+def debug_curve_structure(curve, name="curve", max_depth=5):
+    obj = curve
+    print(f"DEBUG {name}: top-level type={type(obj).__name__}")
+    for depth in range(max_depth):
+        arr = np.asarray(obj, dtype=object)
+        print(f" depth={depth}, type={type(obj).__name__}, shape={getattr(arr, 'shape', None)}, dtype={getattr(arr, 'dtype', None)}")
+        if arr.ndim == 0:
+            obj = arr.item()
+            continue
+        if arr.dtype == object and arr.size == 1:
+            obj = arr.reshape(-1)[0]
+            continue
+        break
+    try:
+        arr_num = np.asarray(obj)
+        print(f" final candidate shape={arr_num.shape}, dtype={arr_num.dtype}")
+    except Exception as e:
+        print(f" final conversion failed: {e}")
 
 def summarize_curve_collection(name, curves, max_preview=3):
     curve_list = flatten_curve_container(curves)
@@ -453,6 +536,7 @@ def summarize_curve_collection(name, curves, max_preview=3):
         v, i = extract_vi(curve_list[idx])
         if v is None or i is None:
             print(f"  - curve[{idx}]: could not extract V/I")
+            debug_curve_structure(curve_list[idx], name=f"{name}[{idx}]")
             continue
         v = np.asarray(v, dtype=float).ravel()
         i = np.asarray(i, dtype=float).ravel()
@@ -472,6 +556,17 @@ def summarize_curve_collection(name, curves, max_preview=3):
             f"  - curve[{idx}]: len(V)={len(v)}, len(I)={len(i)}, "
             f"Voc~{voc:.4f}, Isc~{isc:.4f}, Vmpp~{vmpp:.4f}, Pmpp~{pmpp:.4f}"
         )
+
+
+def count_extractable_curves(curves):
+    ok = 0
+    total = 0
+    for item in flatten_curve_container(curves):
+        total += 1
+        v, i = extract_vi(item)
+        if v is not None and i is not None and len(v) >= 2 and len(i) >= 2:
+            ok += 1
+    return ok, total
 
 # -------------------------
 # CLEANING / VALIDATION
@@ -3179,6 +3274,15 @@ def evaluate_power_metrics(summary: Dict[str, float]):
 sim_curves, exp_curves, selected_sim_keys, selected_exp_keys = load_dataset(DATASET_PATH)
 sim_curves = flatten_curve_container(sim_curves)
 exp_curves = flatten_curve_container(exp_curves)
+
+sim_ok, sim_total = count_extractable_curves(sim_curves)
+exp_ok, exp_total = count_extractable_curves(exp_curves)
+print(f"Extractable simulated curves: {sim_ok}/{sim_total}")
+print(f"Extractable experimental curves: {exp_ok}/{exp_total}")
+if exp_ok == 0:
+    raise ValueError("Experimental keys were selected correctly, but extract_vi() still cannot parse the experimental curve structure.")
+if exp_ok < 0.8 * exp_total:
+    print("WARNING: A large fraction of experimental curves could not be parsed; inspect debug output.")
 
 print("\nSelected dataset sources:")
 print(f"  - selected simulated source keys: {selected_sim_keys}")
