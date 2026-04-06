@@ -54,7 +54,7 @@ class Config:
     sample_fracs_max: float = 0.95
 
     # hybrid controller settings
-    widen_scan_steps: int = 5
+    widen_scan_steps: int = 6
     delta_local: float = 0.05
     shading_peak_threshold: int = 2
     dt_meas: float = 0.001
@@ -62,7 +62,7 @@ class Config:
     dt_hold_probe: float = 0.005
     dt_hold_confirm: float = 0.020
     confirm_gain_eps_ratio: float = 0.001
-    max_refine_iterations: int = 4
+    max_refine_iterations: int = 10
     min_refine_gain_ratio: float = 0.002
 
     # ambiguity / rescue logic
@@ -1776,8 +1776,8 @@ def run_hybrid_episode_logged_baseline(
     Isc = max(oracle.measure(0.0), 1e-9)
     V_best = 0.80 * Voc
     P_best = V_best * oracle.measure(V_best)
-    E, t, hold_dt = add_adaptive_hold(0.0, 0.0, P_best, P_best, cfg)
-    stats.t_hold_total += hold_dt
+    E, t = add_hold(0.0, 0.0, P_best, cfg.dt_hold)
+    stats.t_hold_total += cfg.dt_hold
 
     log = {
         "Voc": Voc, "Isc": Isc, "coarse_V": [], "coarse_P": [], "meas_V": [], "meas_P": [], "meas_tag": [],
@@ -1805,8 +1805,8 @@ def run_hybrid_episode_logged_baseline(
         log["meas_V"].append(float(vq)); log["meas_P"].append(float(pq)); log["meas_tag"].append("coarse")
         p_before = P_best
         V_best, P_best, _ = maybe_update_best(float(vq), float(pq), V_best, P_best)
-        E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
-        stats.t_hold_total += hold_dt
+        E, t = add_hold(E, t, P_best, cfg.dt_hold)
+        stats.t_hold_total += cfg.dt_hold
 
     ann_info = predict_ann_stage_for_oracle(oracle, models, mu, sd, residual_scale, cfg)
     V_target = ann_info["V_pred"]; P_target = ann_info["P_pred"]
@@ -1818,8 +1818,8 @@ def run_hybrid_episode_logged_baseline(
     log["meas_V"].append(float(V_target)); log["meas_P"].append(float(P_target)); log["meas_tag"].append("ann")
     p_before = P_best
     V_best, P_best, _ = maybe_update_best(V_target, P_target, V_best, P_best)
-    E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
-    stats.t_hold_total += hold_dt
+    E, t = add_hold(E, t, P_best, cfg.dt_hold)
+    stats.t_hold_total += cfg.dt_hold
 
     delta = cfg.delta_local
     for _ in range(cfg.max_refine_iterations):
@@ -1837,8 +1837,8 @@ def run_hybrid_episode_logged_baseline(
             old_p = P_best
             V_best, P_best, better = maybe_update_best(float(vq), float(pq), V_best, P_best)
             improved = improved or better or (P_best > old_p)
-            E, t, hold_dt = add_adaptive_hold(E, t, old_p, P_best, cfg)
-            stats.t_hold_total += hold_dt
+            E, t = add_hold(E, t, P_best, cfg.dt_hold)
+            stats.t_hold_total += cfg.dt_hold
         if (P_best - p_round_start) / max(p_round_start, 1e-9) < cfg.min_refine_gain_ratio:
             break
         if not improved:
@@ -1846,7 +1846,12 @@ def run_hybrid_episode_logged_baseline(
             else: break
 
     coarse_best = float(np.max(P_coarse)) if len(P_coarse) else 0.0
-    if P_best < cfg.fallback_power_ratio_thresh * coarse_best:
+    baseline_local_max_count = count_local_maxima(P_coarse, noise_tolerance=0.02)
+    fallback_trigger = (
+        baseline_local_max_count >= cfg.shading_peak_threshold
+        or (P_best < 0.90 * coarse_best)
+    )
+    if fallback_trigger:
         log["fallback"] = True
         for frac in np.linspace(0.15, 0.90, cfg.widen_scan_steps):
             vq = float(frac * Voc); pq = vq * oracle.measure(vq)
@@ -1855,8 +1860,8 @@ def run_hybrid_episode_logged_baseline(
             log["meas_V"].append(float(vq)); log["meas_P"].append(float(pq)); log["meas_tag"].append("fallback_wide")
             p_before = P_best
             V_best, P_best, _ = maybe_update_best(vq, pq, V_best, P_best)
-            E, t, hold_dt = add_adaptive_hold(E, t, p_before, P_best, cfg)
-            stats.t_hold_total += hold_dt
+            E, t = add_hold(E, t, P_best, cfg.dt_hold)
+            stats.t_hold_total += cfg.dt_hold
 
     log["V_best"] = V_best; log["P_best"] = P_best
     log["stage_stats"] = stats.__dict__.copy(); log["total_probe_time"] = float(stats.t_probe_total)
@@ -1885,7 +1890,12 @@ def run_hybrid_episode_logged(
     oracle: CurveOracle, models, mu: np.ndarray, sd: np.ndarray, residual_scale: float, cfg: Config,
     gate_model=None, gate_feature_names=None, trust_threshold=None
 ):
-    return run_hybrid_episode_logged_extended(
+    if cfg.trust_gate_enabled:
+        return run_hybrid_episode_logged_extended(
+            oracle, models, mu, sd, residual_scale, cfg,
+            gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
+        )
+    return run_hybrid_episode_logged_baseline(
         oracle, models, mu, sd, residual_scale, cfg,
         gate_model=gate_model, gate_feature_names=gate_feature_names, trust_threshold=trust_threshold
     )
@@ -2204,7 +2214,7 @@ def evaluate_gated_threshold_sweep(
     for thr in thresholds:
         summary, _, _ = evaluate_unseen_300(
             exp_curves, models, mu, sd, residual_scale, cfg,
-            controller_fn=run_global_gmppt_episode_logged,
+            controller_fn=run_hybrid_episode_logged_extended,
             gate_model=gate_model,
             gate_feature_names=gate_feature_names,
             trust_threshold=float(thr),
@@ -2220,17 +2230,15 @@ def evaluate_gated_threshold_sweep(
 
 def evaluate_static_ab(exp_curves, models, mu, sd, residual_scale, cfg: Config):
     baseline_cfg = Config(**cfg.__dict__)
-    baseline_cfg.use_adaptive_hold = False
-    baseline_cfg.use_lean_global_runtime = False
-    baseline_cfg.enable_top3_rescue = True
     baseline_cfg.max_refine_iterations = 10
-    baseline_cfg.dual_rescue_offsets = (-0.06, -0.03, 0.0, 0.03, 0.06)
-    baseline_cfg.widen_scan_steps = 10
+    baseline_cfg.widen_scan_steps = 6
+    baseline_cfg.dt_hold = 0.050
+    baseline_cfg.trust_gate_enabled = False
     baseline_summary, baseline_df, _ = evaluate_unseen_300(
-        exp_curves, models, mu, sd, residual_scale, baseline_cfg, controller_fn=run_global_gmppt_episode_logged
+        exp_curves, models, mu, sd, residual_scale, baseline_cfg, controller_fn=run_hybrid_episode_logged_baseline
     )
     opt_summary, opt_df, _ = evaluate_unseen_300(
-        exp_curves, models, mu, sd, residual_scale, cfg, controller_fn=run_global_gmppt_episode_logged
+        exp_curves, models, mu, sd, residual_scale, cfg, controller_fn=run_hybrid_episode_logged_extended
     )
     comp = pd.DataFrame([
         {"controller": "baseline", **baseline_summary},
@@ -2256,7 +2264,7 @@ def evaluate_loss_ablation(exp_curves, dataset, cfg):
         print(f"  model {i}: {loss:.6f}")
     baseline_summary, baseline_df, _ = evaluate_unseen_300(
         exp_curves, baseline_models, baseline_mu, baseline_sd, baseline_residual_scale, baseline_cfg,
-        controller_fn=run_global_gmppt_episode_logged
+        controller_fn=run_hybrid_episode_logged_baseline
     )
 
     # Train improved-loss version
@@ -2266,7 +2274,7 @@ def evaluate_loss_ablation(exp_curves, dataset, cfg):
         print(f"  model {i}: {loss:.6f}")
     improved_summary, improved_df, _ = evaluate_unseen_300(
         exp_curves, improved_models, improved_mu, improved_sd, improved_residual_scale, improved_cfg,
-        controller_fn=run_global_gmppt_episode_logged
+        controller_fn=run_hybrid_episode_logged_extended
     )
 
     comp = pd.DataFrame([
@@ -2436,7 +2444,31 @@ if RUN_MODE == "baseline":
     run_cfg.residual_scale_quantile = 0.995
     run_cfg.residual_scale_margin = 1.10
     run_cfg.trust_gate_enabled = False
+    run_cfg.max_refine_iterations = 10
+    run_cfg.widen_scan_steps = 6
+    run_cfg.dt_hold = 0.050
 
+    experiment_manifest = {
+        "run_mode": RUN_MODE,
+        "controller_eval": "run_hybrid_episode_logged_baseline",
+        "power_first_eval_only": True,
+        "baseline_pipeline": "12-point coarse -> ANN probe -> local refine -> wide fallback",
+        "baseline_disabled_features": [
+            "trust_gate_split",
+            "loss_ablation",
+            "static_ab",
+            "dynamic_ab",
+            "dual_peak_rescue",
+            "top3_rescue",
+            "targeted_fallback",
+            "supervisory_switching",
+        ],
+        "max_refine_iterations": run_cfg.max_refine_iterations,
+        "widen_scan_steps": run_cfg.widen_scan_steps,
+        "dt_hold": run_cfg.dt_hold,
+    }
+    print("\n=== EXPERIMENT MANIFEST ===")
+    print(experiment_manifest)
     print("\nTraining baseline ANN ensemble (original loss only)...")
     models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, run_cfg)
 
@@ -2492,6 +2524,17 @@ if RUN_MODE == "baseline":
     )
 
 else:
+    experiment_manifest = {
+        "run_mode": RUN_MODE,
+        "controller_eval": "run_hybrid_episode_logged_extended",
+        "trust_gate_split": bool(RUN_TRUST_GATE),
+        "loss_ablation": bool(RUN_LOSS_ABLATION),
+        "static_ab": bool(RUN_STATIC_AB),
+        "dynamic_ab": bool(RUN_DYNAMIC_AB),
+        "improvement_aware_loss": bool(run_cfg.improvement_loss_enabled),
+    }
+    print("\n=== EXPERIMENT MANIFEST ===")
+    print(experiment_manifest)
     print("\nTraining extended ANN ensemble...")
     models, mu, sd, histories, best_losses, residual_scale = train_ensemble(dataset, run_cfg)
 
