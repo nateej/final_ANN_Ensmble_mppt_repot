@@ -37,7 +37,11 @@ DATASET_PATH = None
 MAKE_PLOTS = True
 SAVE_MODEL_BUNDLE = True
 
-RUN_MODE = "baseline"   # "baseline" or "extended"
+MODEL_MODE = "mamba_supervised"   # allowed: "mlp_baseline", "mamba_supervised", "mamba_pinn"
+CONTROL_MODE = "supervised_voltage"   # allowed: "supervised_voltage", "rl_control"
+SAVE_RUN_ARTIFACTS = True
+
+RUN_MODE = "baseline"   # legacy flag kept for compatibility
 RUN_LOSS_ABLATION = False
 RUN_TRUST_GATE = False
 RUN_STATIC_AB = False
@@ -115,6 +119,24 @@ class Config:
     residual_scale_min: float = 0.10
     residual_scale_quantile: float = 0.98   # baseline was 0.995
     residual_scale_margin: float = 1.00     # baseline was 1.10
+
+    # sequence / mamba experiment config
+    model_mode: str = MODEL_MODE
+    control_mode: str = CONTROL_MODE
+    save_run_artifacts: bool = SAVE_RUN_ARTIFACTS
+    d_model: int = 64
+    n_blocks: int = 2
+    seq_dropout: float = 0.05
+    warmup_epochs: int = 5
+    min_lr: float = 1e-5
+    grad_clip_norm: float = 1.0
+    w_v: float = 0.25
+    w_p: float = 0.55
+    w_rank: float = 0.20
+    w_data: float = 1.0
+    w_phys: float = 0.10
+    w_mpp: float = 0.10
+    w_bound: float = 0.05
 
     # ensemble
     ensemble_size: int = 3
@@ -2412,9 +2434,353 @@ def plot_final_error_distribution(df_results):
     plt.show()
 
 # -------------------------
+# experiment_config.py
+# -------------------------
+ALLOWED_MODEL_MODES = ("mlp_baseline", "mamba_supervised", "mamba_pinn")
+ALLOWED_CONTROL_MODES = ("supervised_voltage", "rl_control")
+
+# -------------------------
+# data_pipeline.py
+# -------------------------
+def split_curves_train_val_test(curves, train_ratio=0.70, val_ratio=0.15, seed=7):
+    curve_list = list(iter_curve_items(curves))
+    rng = np.random.default_rng(seed)
+    idx = np.arange(len(curve_list))
+    rng.shuffle(idx)
+    n = len(idx)
+    n_train = int(train_ratio * n)
+    n_val = int(val_ratio * n)
+    tr = [curve_list[i] for i in idx[:n_train]]
+    va = [curve_list[i] for i in idx[n_train:n_train + n_val]]
+    te = [curve_list[i] for i in idx[n_train + n_val:]]
+    return tr, va, te
+
+def augment_curve_psc(v: np.ndarray, i: np.ndarray, rng: np.random.Generator, test_only_unseen=False):
+    v2 = np.asarray(v, dtype=np.float32).copy()
+    i2 = np.asarray(i, dtype=np.float32).copy()
+    if len(v2) < 8:
+        return v2, i2
+    # random irradiance scaling on sub-strings
+    n_seg = int(rng.integers(2, 5))
+    seg = np.array_split(np.arange(len(i2)), n_seg)
+    for ids in seg:
+        i2[ids] *= float(rng.uniform(0.65, 1.05))
+    # random current drop segments
+    for _ in range(int(rng.integers(1, 4))):
+        a = int(rng.integers(0, len(i2) - 2)); b = int(rng.integers(a + 1, len(i2)))
+        i2[a:b] *= float(rng.uniform(0.55, 0.95))
+    # random local noise
+    i2 += rng.normal(0.0, 0.01 * max(float(np.max(np.abs(i2))), 1e-6), size=i2.shape).astype(np.float32)
+    # random voltage-axis compression/expansion
+    v2 *= float(rng.uniform(0.9, 1.1))
+    if test_only_unseen:
+        for _ in range(2):
+            a = int(rng.integers(0, len(i2)-3)); b = int(min(len(i2), a + rng.integers(2, 6)))
+            i2[a:b] *= float(rng.uniform(0.4, 0.8))
+    return v2, np.maximum(i2, 0.0)
+
+def build_sequence_dataset_from_curves(curves, sample_fracs: np.ndarray, cfg: Config, augment=False, test_only_unseen=False):
+    X_seq, y_vhat, y_power, y_coarse = [], [], [], []
+    meta = {"coarse_ratio_pct": [], "coarse_diff_pct": [], "multi_peak_count": [], "ambiguity_flag": []}
+    rng = np.random.default_rng(cfg.seed + (13 if augment else 0))
+
+    for item in list(iter_curve_items(curves)):
+        v_raw, i_raw = extract_vi(item)
+        if v_raw is None or i_raw is None:
+            continue
+        v, i = clean_iv_curve(v_raw, i_raw)
+        if len(v) < 5 or not validate_cleaned_curve(v, i):
+            continue
+        if augment:
+            v, i = augment_curve_psc(v, i, rng, test_only_unseen=test_only_unseen)
+            v, i = clean_iv_curve(v, i)
+            if len(v) < 5 or not validate_cleaned_curve(v, i):
+                continue
+
+        oracle = CurveOracle({"V": v, "I": i})
+        feat = build_feature_vector(v, i, sample_fracs)
+        voc = max(float(oracle.voc), 1e-6)
+        isc = max(float(oracle.isc), 1e-6)
+
+        vq = sample_fracs.astype(np.float32)
+        vv = np.clip(vq * voc, np.min(v), np.max(v))
+        ii = np.interp(vv, v, i).astype(np.float32)
+        i_norm = ii / isc
+        p_norm = (vq * i_norm).astype(np.float32)
+        dpdv_local = np.gradient(p_norm, vq, edge_order=1).astype(np.float32)
+        delta_i_next = np.zeros_like(i_norm, dtype=np.float32)
+        delta_i_next[:-1] = i_norm[1:] - i_norm[:-1]
+
+        x_step = np.stack([vq, i_norm, p_norm, dpdv_local, delta_i_next], axis=-1).astype(np.float32)
+
+        X_seq.append(x_step)
+        y_vhat.append(np.float32(oracle.vmpp_true / voc))
+        y_power.append(np.float32(oracle.pmpp_true / (voc * isc)))
+        y_coarse.append(np.float32(feat["coarse_best_vhat"]))
+
+        coarse_v = float(feat["coarse_best_vhat"]) * voc
+        coarse_p = coarse_v * float(np.interp(coarse_v, v, i))
+        meta["coarse_ratio_pct"].append(np.float32(100.0 * coarse_p / max(oracle.pmpp_true, 1e-9)))
+        meta["coarse_diff_pct"].append(np.float32(100.0 * abs((coarse_v - oracle.vmpp_true) / max(oracle.vmpp_true, 1e-9))))
+        meta["multi_peak_count"].append(np.float32(feat["multi_peak_count"]))
+        meta["ambiguity_flag"].append(np.float32(feat["ambiguity_flag"]))
+
+    return {
+        "X_seq": np.asarray(X_seq, dtype=np.float32),
+        "y_vhat_true": np.asarray(y_vhat, dtype=np.float32),
+        "y_power_true": np.asarray(y_power, dtype=np.float32),
+        "y_coarse_vhat": np.asarray(y_coarse, dtype=np.float32),
+        **{k: np.asarray(v, dtype=np.float32) for k, v in meta.items()},
+    }
+
+# -------------------------
+# models.py
+# -------------------------
+try:
+    from mamba_ssm import Mamba  # type: ignore
+except Exception:
+    Mamba = None
+
+class _FallbackMambaBlock(nn.Module):
+    def __init__(self, d_model, dropout=0.05):
+        super().__init__()
+        self.ff = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_model, d_model))
+        self.ln = nn.LayerNorm(d_model)
+    def forward(self, x):
+        return self.ln(x + self.ff(x))
+
+class MambaVhatNet(nn.Module):
+    def __init__(self, in_features: int, d_model: int = 64, n_blocks: int = 2, dropout: float = 0.05):
+        super().__init__()
+        self.proj = nn.Linear(in_features, d_model)
+        blocks = []
+        for _ in range(int(n_blocks)):
+            if Mamba is not None:
+                blocks.append(nn.Sequential(Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2), nn.Dropout(dropout)))
+            else:
+                blocks.append(_FallbackMambaBlock(d_model=d_model, dropout=dropout))
+        self.blocks = nn.ModuleList(blocks)
+        self.head = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Linear(d_model // 2, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        h = self.proj(x)
+        for blk in self.blocks:
+            h = blk(h)
+        out = self.head(h[:, -1, :]).squeeze(-1)
+        return torch.clamp(out, 0.0, 1.0)
+
+# -------------------------
+# losses.py
+# -------------------------
+def estimate_power_at_predicted_vhat(pred_vhat, seq_x):
+    v = seq_x[:, :, 0]
+    p = seq_x[:, :, 2]
+    dist = torch.abs(v - pred_vhat.unsqueeze(-1))
+    idx = torch.argmin(dist, dim=1)
+    p_pick = p[torch.arange(p.shape[0], device=p.device), idx]
+    return p_pick
+
+def supervised_power_first_loss(pred_vhat, true_vhat, true_power_ratio, coarse_vhat, seq_x, cfg: Config):
+    pred_power_ratio = estimate_power_at_predicted_vhat(pred_vhat, seq_x)
+    coarse_power_ratio = estimate_power_at_predicted_vhat(coarse_vhat, seq_x)
+    l_voltage = nn.SmoothL1Loss()(pred_vhat, true_vhat)
+    l_power = nn.SmoothL1Loss()(pred_power_ratio, true_power_ratio)
+    l_rank = torch.relu(coarse_power_ratio - pred_power_ratio).mean()
+    total = cfg.w_v * l_voltage + cfg.w_p * l_power + cfg.w_rank * l_rank
+    return total, {"L_voltage": l_voltage.item(), "L_power": l_power.item(), "L_rank": l_rank.item()}
+
+def pinn_loss(pred_vhat, true_vhat, true_power_ratio, coarse_vhat, seq_x, cfg: Config):
+    pred_vhat = pred_vhat.requires_grad_(True)
+    pred_power_ratio = estimate_power_at_predicted_vhat(pred_vhat, seq_x)
+    l_voltage = nn.SmoothL1Loss()(pred_vhat, true_vhat)
+    l_power = nn.SmoothL1Loss()(pred_power_ratio, true_power_ratio)
+    grad = torch.autograd.grad(pred_power_ratio.sum(), pred_vhat, create_graph=True, retain_graph=True)[0]
+    l_mpp = (grad ** 2).mean()
+    l_bound = (torch.relu(-pred_vhat) + torch.relu(pred_vhat - 1.0)).mean()
+    l_phys = ((pred_power_ratio - seq_x[:, :, 2].max(dim=1).values) ** 2).mean()
+    total = cfg.w_data * (l_voltage + l_power) + cfg.w_phys * l_phys + cfg.w_mpp * l_mpp + cfg.w_bound * l_bound
+    return total
+
+# -------------------------
+# train_eval.py
+# -------------------------
+def train_model(train_data: Dict[str, np.ndarray], val_data: Dict[str, np.ndarray], cfg: Config):
+    if cfg.model_mode == "mlp_baseline":
+        flat_dataset = build_dataset_from_curves(train_data["curves"], cfg.sample_fracs, cfg)
+        return {"kind": "mlp", "bundle": train_ensemble(flat_dataset, cfg)}
+
+    x_tr = torch.tensor(train_data["X_seq"], dtype=torch.float32, device=cfg.device)
+    yv_tr = torch.tensor(train_data["y_vhat_true"], dtype=torch.float32, device=cfg.device)
+    yp_tr = torch.tensor(train_data["y_power_true"], dtype=torch.float32, device=cfg.device)
+    yc_tr = torch.tensor(train_data["y_coarse_vhat"], dtype=torch.float32, device=cfg.device)
+
+    x_va = torch.tensor(val_data["X_seq"], dtype=torch.float32, device=cfg.device)
+    yv_va = torch.tensor(val_data["y_vhat_true"], dtype=torch.float32, device=cfg.device)
+    yp_va = torch.tensor(val_data["y_power_true"], dtype=torch.float32, device=cfg.device)
+    yc_va = torch.tensor(val_data["y_coarse_vhat"], dtype=torch.float32, device=cfg.device)
+
+    model = MambaVhatNet(in_features=x_tr.shape[-1], d_model=cfg.d_model, n_blocks=cfg.n_blocks, dropout=cfg.seq_dropout).to(cfg.device)
+    opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    def lr_lambda(ep):
+        if ep < cfg.warmup_epochs:
+            return max((ep + 1) / max(cfg.warmup_epochs, 1), 1e-3)
+        t = (ep - cfg.warmup_epochs) / max(cfg.epochs - cfg.warmup_epochs, 1)
+        return cfg.min_lr / cfg.lr + 0.5 * (1 - cfg.min_lr / cfg.lr) * (1 + np.cos(np.pi * t))
+
+    sch = optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+    bs = cfg.batch_size
+    best = (1e9, None)
+
+    for ep in range(cfg.epochs):
+        model.train()
+        perm = torch.randperm(x_tr.shape[0], device=cfg.device)
+        for st in range(0, x_tr.shape[0], bs):
+            bi = perm[st:st + bs]
+            xb, yvb, ypb, ycb = x_tr[bi], yv_tr[bi], yp_tr[bi], yc_tr[bi]
+            opt.zero_grad()
+            pred = model(xb)
+            if cfg.model_mode == "mamba_pinn":
+                loss = pinn_loss(pred, yvb, ypb, ycb, xb, cfg)
+            else:
+                loss, _ = supervised_power_first_loss(pred, yvb, ypb, ycb, xb, cfg)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+            opt.step()
+        sch.step()
+
+        model.eval()
+        with torch.no_grad():
+            pv = model(x_va)
+            if cfg.model_mode == "mamba_pinn":
+                vloss = nn.SmoothL1Loss()(pv, yv_va).item()
+            else:
+                vloss = supervised_power_first_loss(pv, yv_va, yp_va, yc_va, x_va, cfg)[0].item()
+        if vloss < best[0]:
+            best = (vloss, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+
+    if best[1] is not None:
+        model.load_state_dict(best[1])
+    return {"kind": cfg.model_mode, "model": model}
+
+def _predict_ann_vhat_for_curve(curve_item, trained, cfg: Config):
+    oracle = CurveOracle(curve_item)
+    feat = build_feature_vector(oracle.v, oracle.i, cfg.sample_fracs)
+    if trained["kind"] == "mlp":
+        models, mu, sd, _, _, residual_scale = trained["bundle"]
+        x_std = (feat["x"] - mu) / sd
+        ens = predict_vhat_ensemble(models, x_std, float(feat["coarse_best_vhat"]), residual_scale, cfg.device)
+        return float(ens["pred_vhat_mean"])
+
+    seq = build_sequence_dataset_from_curves([curve_item], cfg.sample_fracs, cfg, augment=False)
+    if len(seq["X_seq"]) == 0:
+        return float(feat["coarse_best_vhat"])
+    x = torch.tensor(seq["X_seq"], dtype=torch.float32, device=cfg.device)
+    with torch.no_grad():
+        vhat = float(trained["model"](x).detach().cpu().numpy()[0])
+    return float(np.clip(vhat, 0.0, 1.0))
+
+def evaluate_ann_only(test_curves, trained, cfg: Config):
+    rows = []
+    for item in list(iter_curve_items(test_curves)):
+        oracle = CurveOracle(item)
+        if oracle.voc <= 0 or oracle.pmpp_true <= 0:
+            continue
+        feat = build_feature_vector(oracle.v, oracle.i, cfg.sample_fracs)
+        coarse_vhat = float(feat["coarse_best_vhat"])
+        ann_vhat = _predict_ann_vhat_for_curve(item, trained, cfg)
+        V_true, P_true = float(oracle.vmpp_true), float(oracle.pmpp_true)
+        V_coarse_best = float(coarse_vhat * oracle.voc)
+        P_coarse_best = float(V_coarse_best * oracle.measure(V_coarse_best))
+        V_ann = float(ann_vhat * oracle.voc)
+        P_ann = float(V_ann * oracle.measure(V_ann))
+        coarse_ratio_pct = 100.0 * P_coarse_best / max(P_true, 1e-9)
+        ann_ratio_pct = 100.0 * P_ann / max(P_true, 1e-9)
+        coarse_reg = 100.0 * max(P_true - P_coarse_best, 0.0) / max(P_true, 1e-9)
+        ann_reg = 100.0 * max(P_true - P_ann, 0.0) / max(P_true, 1e-9)
+        rows.append({
+            "V_true": V_true, "P_true": P_true,
+            "V_coarse_best": V_coarse_best, "P_coarse_best": P_coarse_best,
+            "V_ann": V_ann, "P_ann": P_ann,
+            "coarse_ratio_pct": coarse_ratio_pct, "ann_ratio_pct": ann_ratio_pct,
+            "coarse_power_regret_pct": coarse_reg, "ann_power_regret_pct": ann_reg,
+            "ann_better_than_coarse_power": int(P_ann > P_coarse_best + 1e-9),
+            "ann_worse_than_coarse_power": int(P_ann + 1e-9 < P_coarse_best),
+        })
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return {}, df
+    summary = {
+        "mean_coarse_ratio_pct": float(df["coarse_ratio_pct"].mean()),
+        "mean_ann_ratio_pct": float(df["ann_ratio_pct"].mean()),
+        "ann_power_gain_vs_coarse_pct_points": float(df["ann_ratio_pct"].mean() - df["coarse_ratio_pct"].mean()),
+        "ann_better_than_coarse_power_rate": float(100.0 * df["ann_better_than_coarse_power"].mean()),
+        "ann_worse_than_coarse_power_rate": float(100.0 * df["ann_worse_than_coarse_power"].mean()),
+        "mean_ann_power_regret_pct": float(df["ann_power_regret_pct"].mean()),
+        "mean_coarse_power_regret_pct": float(df["coarse_power_regret_pct"].mean()),
+        "ann_within_1pct_power_regret_rate": float(100.0 * (df["ann_power_regret_pct"] <= 1.0).mean()),
+        "ann_within_2pct_power_regret_rate": float(100.0 * (df["ann_power_regret_pct"] <= 2.0).mean()),
+        "ann_within_5pct_power_regret_rate": float(100.0 * (df["ann_power_regret_pct"] <= 5.0).mean()),
+    }
+    return summary, df
+
+def evaluate_supervised_ann(test_curves, trained, cfg: Config):
+    return evaluate_ann_only(test_curves, trained, cfg)
+
+def evaluate_power_metrics(summary: Dict[str, float]):
+    return {
+        "pass_mean_ratio": summary.get("mean_ann_ratio_pct", -1) > summary.get("mean_coarse_ratio_pct", 1e9),
+        "pass_gain": summary.get("ann_power_gain_vs_coarse_pct_points", -1) > 0,
+        "pass_better_rate": summary.get("ann_better_than_coarse_power_rate", 0) >= 60.0,
+        "pass_regret": summary.get("mean_ann_power_regret_pct", 1e9) < summary.get("mean_coarse_power_regret_pct", -1),
+    }
+
+# -------------------------
 # RUN PIPELINE
 # -------------------------
 sim_curves, exp_curves = load_dataset(DATASET_PATH)
+
+if MODEL_MODE not in ALLOWED_MODEL_MODES:
+    raise ValueError(f"MODEL_MODE must be one of {ALLOWED_MODEL_MODES}, got {MODEL_MODE}")
+if CONTROL_MODE not in ALLOWED_CONTROL_MODES:
+    raise ValueError(f"CONTROL_MODE must be one of {ALLOWED_CONTROL_MODES}, got {CONTROL_MODE}")
+
+if CONTROL_MODE == "supervised_voltage":
+    train_curves, val_curves, test_curves = split_curves_train_val_test(sim_curves, seed=cfg.seed)
+    if MODEL_MODE == "mlp_baseline":
+        train_payload = {"curves": train_curves}
+        val_payload = {"curves": val_curves}
+    else:
+        train_payload = build_sequence_dataset_from_curves(train_curves, cfg.sample_fracs, cfg, augment=True, test_only_unseen=False)
+        val_payload = build_sequence_dataset_from_curves(val_curves, cfg.sample_fracs, cfg, augment=False, test_only_unseen=False)
+        _ = build_sequence_dataset_from_curves(test_curves, cfg.sample_fracs, cfg, augment=True, test_only_unseen=True)
+
+    run_cfg = Config(**cfg.__dict__)
+    run_cfg.model_mode = MODEL_MODE
+    run_cfg.control_mode = CONTROL_MODE
+    trained = train_model(train_payload, val_payload, run_cfg)
+
+    eval_summary, eval_df = evaluate_supervised_ann(exp_curves, trained, run_cfg)
+    power_eval = evaluate_power_metrics(eval_summary) if len(eval_summary) > 0 else {}
+
+    print("\n=== ANN-ONLY EVALUATION (NO HYBRID FALLBACK) ===")
+    for k, v in eval_summary.items():
+        print(f"{k}: {v}")
+    print("pass_criteria:", power_eval)
+
+    if SAVE_RUN_ARTIFACTS and len(eval_summary) > 0:
+        artifact = {
+            "model_mode": MODEL_MODE,
+            "control_mode": CONTROL_MODE,
+            "config": run_cfg.__dict__,
+            "summary": eval_summary,
+            "pass_criteria": power_eval,
+            "rows_head": eval_df.head(100).to_dict(orient="records"),
+        }
+        torch.save(artifact, f"ann_only_{MODEL_MODE}_artifacts.pt")
+        print(f"Saved: ann_only_{MODEL_MODE}_artifacts.pt")
+
+    raise SystemExit(0)
 
 print("\nBuilding cleaned training dataset from simulated curves...")
 dataset = build_dataset_from_curves(sim_curves, cfg.sample_fracs, cfg)
